@@ -10,6 +10,7 @@
 mod danmaku;
 mod douyu;
 mod log;
+mod login;
 mod mpvffi;
 mod relay;
 mod sign;
@@ -33,6 +34,15 @@ struct GlVideoTarget {
     tex_id: egui::TextureId,
     w: usize,
     h: usize,
+}
+
+/// 扫码登录的界面状态
+struct LoginUi {
+    qr_tex: Option<egui::TextureHandle>,
+    qr_px: usize,
+    code: String,
+    status: String,
+    last_poll: Instant,
 }
 
 /// 一条待显示的弹幕（位置由绘制时按出生时间计算）
@@ -78,6 +88,10 @@ struct DouyuApp {
     fps_timer: Instant,
     last_fps: f32,
     source_fps: f32,
+
+    // 登录
+    login: Option<LoginUi>,
+    logged_in_as: Option<String>,
 
     // 弹幕
     danmaku_on: Arc<AtomicBool>,
@@ -174,6 +188,8 @@ impl DouyuApp {
             fps_timer: Instant::now(),
             last_fps: 0.0,
             source_fps: 0.0,
+            login: None,
+            logged_in_as: login::load_cookie().map(|c| login::nickname(&c)),
             danmaku_on: Arc::new(AtomicBool::new(true)),
             danmaku_stop: Arc::new(AtomicBool::new(false)),
             danmaku_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -234,6 +250,62 @@ impl DouyuApp {
         });
 
         self.status = format!("正在播放房间 {rid}");
+    }
+
+    /// 打开扫码登录：生成二维码并显示
+    fn open_login(&mut self, ctx: &egui::Context) {
+        match login::generate() {
+            Ok(sess) => {
+                let (tex, px) = make_qr_texture(ctx, &sess.url);
+                self.login = Some(LoginUi {
+                    qr_tex: tex,
+                    qr_px: px,
+                    code: sess.code,
+                    status: "等待扫码…".to_string(),
+                    // 让它立刻轮询一次
+                    last_poll: Instant::now() - Duration::from_secs(10),
+                });
+            }
+            Err(e) => {
+                self.status = format!("获取二维码失败: {e}");
+            }
+        }
+    }
+
+    /// 每 2 秒轮询一次扫码状态
+    fn poll_login(&mut self) {
+        let code = match &self.login {
+            Some(l) if l.last_poll.elapsed() >= Duration::from_secs(2) => l.code.clone(),
+            _ => return,
+        };
+        if let Some(l) = &mut self.login {
+            l.last_poll = Instant::now();
+        }
+        match login::poll(&code) {
+            Ok(login::PollState::Success(cookie)) => {
+                let nick = login::nickname(&cookie);
+                self.logged_in_as = Some(nick.clone());
+                self.login = None;
+                self.status = format!("已登录「{nick}」，重新加载房间即可看原画");
+            }
+            Ok(st) => {
+                let txt = match st {
+                    login::PollState::Waiting => "等待扫码…",
+                    login::PollState::Scanned => "已扫码，请在手机上点确认",
+                    login::PollState::Expired => "二维码已过期，点「刷新」",
+                    login::PollState::Rejected => "已取消登录",
+                    login::PollState::Success(_) => "",
+                };
+                if let Some(l) = &mut self.login {
+                    l.status = txt.to_string();
+                }
+            }
+            Err(e) => {
+                if let Some(l) = &mut self.login {
+                    l.status = format!("轮询出错: {e}");
+                }
+            }
+        }
     }
 
     fn drain_danmaku(&mut self) {
@@ -531,6 +603,17 @@ impl eframe::App for DouyuApp {
                     if ui.button("全屏 (f)").clicked() {
                         self.toggle_fullscreen(ctx);
                     }
+                    ui.separator();
+                    match self.logged_in_as.clone() {
+                        Some(n) => {
+                            ui.label(egui::RichText::new(format!("👤 {n}")).small());
+                        }
+                        None => {
+                            if ui.button("扫码登录").clicked() {
+                                self.open_login(ctx);
+                            }
+                        }
+                    }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.label(egui::RichText::new(&self.status).small());
                         if self.last_fps > 0.0 {
@@ -631,6 +714,45 @@ impl eframe::App for DouyuApp {
             self.toggle_fullscreen(ctx);
         }
 
+        // 扫码登录：轮询状态 + 二维码弹窗
+        self.poll_login();
+        let mut close_login = false;
+        let mut refresh_login = false;
+        if let Some(lg) = &self.login {
+            egui::Window::new("扫码登录斗鱼")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label("请用斗鱼 App 扫码登录");
+                        ui.add_space(4.0);
+                        if let Some(tex) = &lg.qr_tex {
+                            ui.image((tex.id(), egui::vec2(lg.qr_px as f32, lg.qr_px as f32)));
+                        } else {
+                            ui.label("二维码生成失败");
+                        }
+                        ui.add_space(4.0);
+                        ui.label(&lg.status);
+                        ui.horizontal(|ui| {
+                            if ui.button("刷新").clicked() {
+                                refresh_login = true;
+                            }
+                            if ui.button("关闭").clicked() {
+                                close_login = true;
+                            }
+                        });
+                    });
+                });
+        }
+        if refresh_login {
+            self.login = None;
+            self.open_login(ctx);
+        }
+        if close_login {
+            self.login = None;
+        }
+
         // 帧率统计（每秒一次），同时读取 mpv 源帧率和视频参数
         self.frame_count += 1;
         let fe = self.fps_timer.elapsed();
@@ -680,6 +802,37 @@ impl eframe::App for DouyuApp {
     }
 }
 
+/// 把二维码内容渲染成 egui 纹理（每个模块放大 6 像素）
+fn make_qr_texture(ctx: &egui::Context, url: &str) -> (Option<egui::TextureHandle>, usize) {
+    let (w, px) = match login::qr_matrix(url) {
+        Ok(v) => v,
+        Err(e) => {
+            logln!("[login] 二维码矩阵生成失败: {e}");
+            return (None, 0);
+        }
+    };
+    let scale = 6usize;
+    let size = w * scale;
+    let mut pixels = vec![egui::Color32::WHITE; size * size];
+    for y in 0..w {
+        for x in 0..w {
+            if px[y * w + x] {
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        pixels[(y * scale + dy) * size + x * scale + dx] = egui::Color32::BLACK;
+                    }
+                }
+            }
+        }
+    }
+    let img = egui::ColorImage {
+        size: [size, size],
+        pixels,
+    };
+    let tex = ctx.load_texture("login_qr", img, egui::TextureOptions::NEAREST);
+    (Some(tex), size)
+}
+
 /// 把 16:9 视频适配进 avail（保持比例，取最大可能尺寸）
 fn fit_169(avail: egui::Vec2) -> (f32, f32) {
     let aw = avail.x.max(1.0);
@@ -726,6 +879,7 @@ fn main() {
         match args[1].as_str() {
             "danmaku-test" => return cmd_danmaku_test(&args[2..]),
             "relay-test" => return cmd_relay_test(&args[2..]),
+            "login-test" => return cmd_login_test(),
             _ => {}
         }
     }
@@ -777,7 +931,10 @@ fn cmd_relay_test(rest: &[String]) {
         .first()
         .cloned()
         .unwrap_or_else(|| "1126960".to_string());
-    let state: relay::StreamState = Arc::new(Mutex::new((rid, 4)));
+    // 第二个参数可选：画质档位（默认 4）
+    let rate: i32 = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
+    logln!("[test] relay-test rid={rid} rate={rate}");
+    let state: relay::StreamState = Arc::new(Mutex::new((rid, rate)));
     let port = relay::Relay::new(state).start().expect("启动 relay 失败");
     let url = format!("http://127.0.0.1:{port}/live.flv");
     println!("relay 已启动: {url}");
@@ -813,5 +970,21 @@ fn cmd_relay_test(rest: &[String]) {
             i += 11 + sz + 4;
         }
         println!("解析到 {tags} 个 FLV tag");
+    }
+}
+
+/// 调试：验证二维码登录 API 是否可用
+fn cmd_login_test() {
+    match login::generate() {
+        Ok(s) => {
+            let code_short = &s.code[..s.code.len().min(20)];
+            let url_short = &s.url[..s.url.len().min(90)];
+            logln!("[test] 二维码生成成功 code={code_short} url={url_short}");
+            match login::poll(&s.code) {
+                Ok(st) => logln!("[test] 首次轮询状态: {st:?}"),
+                Err(e) => logln!("[test] 轮询失败: {e}"),
+            }
+        }
+        Err(e) => logln!("[test] 二维码生成失败: {e}"),
     }
 }

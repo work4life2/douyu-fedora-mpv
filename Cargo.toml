@@ -17,6 +17,7 @@ tungstenite = { version = "0.24", features = ["native-tls"] }
 native-tls = "0.2"
 eframe = "0.29"
 libloading = "0.8"
+qrcode = "0.14"
 
 [profile.release]
 opt-level = "z"     # 体积优先

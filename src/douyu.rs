@@ -36,15 +36,32 @@ fn get(url: &str, referer: &str) -> Result<String, String> {
 }
 
 fn post(url: &str, referer: &str, body: &str) -> Result<String, String> {
-    let resp = agent()
+    let mut req = agent()
         .post(url)
         .set("User-Agent", UA)
         .set("Referer", referer)
-        .set("Content-Type", "application/x-www-form-urlencoded")
+        .set("Content-Type", "application/x-www-form-urlencoded");
+    // 带登录态（解锁原画、避免 5 分钟断流）
+    if let Some(c) = crate::login::load_cookie() {
+        req = req.set("Cookie", &c);
+    }
+    let resp = req
         .send_string(body)
         .map_err(|e| format!("请求失败 {}: {}", url, e))?;
     resp.into_string()
         .map_err(|e| format!("读取响应失败: {}", e))
+}
+
+/// 当前使用的设备号：登录态优先用 cookie 里的 acf_did（否则签名与登录态不匹配会被降级）
+fn current_did() -> String {
+    if let Some(c) = crate::login::load_cookie() {
+        if let Some(d) = crate::login::cookie_value(&c, "acf_did") {
+            if !d.is_empty() {
+                return d;
+            }
+        }
+    }
+    DID.to_string()
 }
 
 /// 按房间获取签名脚本（脚本按房间下发，不能复用）
@@ -84,11 +101,13 @@ struct H5Data {
 pub struct Rate {
     #[allow(dead_code)]
     pub name: String,
-    #[allow(dead_code)]
     pub rate: i32,
     #[allow(dead_code)]
     #[serde(default)]
     pub bit: Option<i64>,
+    /// 该档位的独立播放地址（顶层 rtmp_live 常是默认转码档，如 _4000）
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// 取流结果
@@ -106,14 +125,22 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
         .map_err(|e| e.to_string())?
         .as_secs() as i64;
 
-    let signed = crate::sign::sign(rid, DID, tt, &script)?;
+    let did = current_did();
+    let signed = crate::sign::sign(rid, &did, tt, &script)?;
     // cdn 参数影响斗鱼下发的线路/转码：ws-h5（H5 端）可能给 30fps 转码流，
     // ws（PC 网页端）通常给原画原始帧率。可用 DOUYU_CDN 覆盖。
     let cdn = std::env::var("DOUYU_CDN").unwrap_or_else(|_| "ws".to_string());
-    let body = format!("{signed}&cdn={cdn}&rate={quality}&iar=0&ive=0&hevc=0&fa=0");
+    // DOUYU_EXTRA 可追加任意调试参数（如 "&substream=3&basesub=6"）
+    let extra = std::env::var("DOUYU_EXTRA").unwrap_or_default();
+    let body = format!("{signed}&cdn={cdn}&rate={quality}&iar=0&ive=0&hevc=0&fa=0{extra}");
 
     let url = format!("https://www.douyu.com/lapi/live/getH5Play/{rid}");
     let resp_body = post(&url, &format!("https://www.douyu.com/{rid}"), &body)?;
+    // 调试：DOUYU_DEBUG=1 时记录原始响应（确认 multirates 是否带 url 字段）
+    if std::env::var("DOUYU_DEBUG").ok().as_deref() == Some("1") {
+        let n = resp_body.len().min(2500);
+        logln!("[stream] 原始响应({}B): {}", resp_body.len(), &resp_body[..n]);
+    }
     let resp: H5Resp =
         serde_json::from_str(&resp_body).map_err(|e| format!("取流响应解析失败: {e}"))?;
 
@@ -131,19 +158,36 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
             .map_err(|e| format!("取流 data 解析失败: {e}"))?,
         None => return Err("该房间未开播或不可用".to_string()),
     };
-    let url = format!("{}/{}", d.rtmp_url.trim_end_matches('/'), d.rtmp_live);
+    // 优先用 multirates 里对应档位的独立 url。
+    // 顶层 rtmp_url/rtmp_live 是服务端默认档（实测常是 _4000 转码流，30fps），
+    // 原画（rate=0）的真实流在 multirates[i].url 里（60fps、非 _4000 后缀）。
+    let chosen = d.multirates.iter().find(|r| r.rate == quality);
+    let (url, src_kind) = match chosen.and_then(|r| r.url.clone()) {
+        Some(u) => (u, "multirates.url"),
+        None => (
+            format!("{}/{}", d.rtmp_url.trim_end_matches('/'), d.rtmp_live),
+            "top-level(rtmp_live)",
+        ),
+    };
     // 日志只记录主机部分（避免 token 刷屏，也不泄露完整鉴权串）
     let host = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+    let tail = url.split('/').last().unwrap_or("");
+    let tail_short = if tail.len() > 46 { &tail[..46] } else { tail };
     logln!(
-        "[stream] 取流成功 rid={rid} quality={quality} cdn={cdn} host={host} 档位={}",
+        "[stream] 取流成功 rid={rid} quality={quality} cdn={cdn} host={host} 来源={src_kind} 流={tail_short} 档位={}",
         d.multirates
             .iter()
-            .map(|r| format!("{}:{}", r.rate, r.name))
+            .map(|r| format!(
+                "{}:{}[url={}]",
+                r.rate,
+                r.name,
+                if r.url.is_some() { "有" } else { "无" }
+            ))
             .collect::<Vec<_>>()
             .join(",")
     );
     Ok(Stream {
-        url,
+        url: url.clone(),
         rates: d.multirates,
     })
 }
