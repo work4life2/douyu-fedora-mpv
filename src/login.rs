@@ -312,9 +312,14 @@ pub fn qr_matrix(text: &str) -> Result<(usize, Vec<bool>), String> {
 
 /// 把 RGBA 像素保存成 PNG（手机相册识别的备用方案）
 pub fn save_png(rgba: &[u8], size: usize, filename: &str) -> Result<PathBuf, String> {
-    let path = std::env::current_exe()
+    let path = std::env::current_dir()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join(filename)))
+        .map(|d| d.join(filename))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join(filename)))
+        })
         .unwrap_or_else(|| PathBuf::from(filename));
     let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败: {e}"))?;
     let w = std::io::BufWriter::new(file);

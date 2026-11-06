@@ -1046,9 +1046,12 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 编译期指纹：确认跑的确实是新构建（改代码后这个值会变）
+const BUILD_TAG: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("DOUYU_BUILD"));
+
 fn main() {
     log::init();
-    logln!("=== douyu v{} 启动 ===", env!("CARGO_PKG_VERSION"));
+    logln!("=== douyu v{} 启动（构建 {BUILD_TAG}）===", env!("CARGO_PKG_VERSION"));
 
     // 调试命令（不影响双击启动）
     let args: Vec<String> = std::env::args().collect();

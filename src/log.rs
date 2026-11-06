@@ -20,9 +20,22 @@ pub fn clock() -> String {
 }
 
 pub fn init() {
-    let path = std::env::current_exe()
+    // 优先当前工作目录（用户在哪运行就在哪，最好找），失败回退 exe 目录、HOME
+    let path = std::env::current_dir()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("douyu.log")))
+        .map(|d| d.join("douyu.log"))
+        .filter(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .is_ok()
+        })
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("douyu.log")))
+        })
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
