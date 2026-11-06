@@ -107,9 +107,10 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
         .as_secs() as i64;
 
     let signed = crate::sign::sign(rid, DID, tt, &script)?;
-    let body = format!(
-        "{signed}&cdn=ws-h5&rate={quality}&iar=0&ive=0&hevc=0&fa=0"
-    );
+    // cdn 参数影响斗鱼下发的线路/转码：ws-h5（H5 端）可能给 30fps 转码流，
+    // ws（PC 网页端）通常给原画原始帧率。可用 DOUYU_CDN 覆盖。
+    let cdn = std::env::var("DOUYU_CDN").unwrap_or_else(|_| "ws".to_string());
+    let body = format!("{signed}&cdn={cdn}&rate={quality}&iar=0&ive=0&hevc=0&fa=0");
 
     let url = format!("https://www.douyu.com/lapi/live/getH5Play/{rid}");
     let resp_body = post(&url, &format!("https://www.douyu.com/{rid}"), &body)?;
@@ -134,7 +135,7 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
     // 日志只记录主机部分（避免 token 刷屏，也不泄露完整鉴权串）
     let host = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
     logln!(
-        "[stream] 取流成功 rid={rid} quality={quality} host={host} 档位={}",
+        "[stream] 取流成功 rid={rid} quality={quality} cdn={cdn} host={host} 档位={}",
         d.multirates
             .iter()
             .map(|r| format!("{}:{}", r.rate, r.name))

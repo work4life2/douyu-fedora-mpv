@@ -102,6 +102,7 @@ pub fn run(rid: String, stop: Arc<AtomicBool>, tx: Sender<Chat>) {
         }
         match connect_danmaku() {
             Ok(ws) => {
+                logln!("[danmaku] 已连接房间 {rid}");
                 if let Err(e) = session(ws, &rid, &tx, &stop) {
                     if stop.load(Ordering::Relaxed) {
                         return;
@@ -143,6 +144,8 @@ fn session(
     .map_err(|e| e.to_string())?;
 
     let mut last_hb = std::time::Instant::now();
+    let mut msg_count: u64 = 0;
+    let mut other_types: u64 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -168,8 +171,21 @@ fn session(
                             if !txt.is_empty() && tx.send((nn, txt)).is_err() {
                                 return Ok(()); // 接收端已关闭，退出
                             }
+                            msg_count += 1;
+                            if msg_count % 20 == 1 {
+                                logln!(
+                                    "[danmaku] 已收 {msg_count} 条（最新: {}）",
+                                    field(&m, "txt").unwrap_or("")
+                                );
+                            }
                         }
-                        _ => {}
+                        other => {
+                            other_types += 1;
+                            // 首次收到非 chatmsg 类型时记录，便于诊断（如 loginres/error）
+                            if other_types <= 5 && other != "mrkl" {
+                                logln!("[danmaku] 收到类型 {other}: {}", &m[..m.len().min(120)]);
+                            }
+                        }
                     }
                 }
             }

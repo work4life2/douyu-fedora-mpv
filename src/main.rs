@@ -637,15 +637,20 @@ impl eframe::App for DouyuApp {
         if fe >= Duration::from_secs(1) {
             self.last_fps = self.frame_count as f32 / fe.as_secs_f32();
             let (mut est, mut cont, mut vw, mut vh) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut drops, mut dec_drops, mut mistimed) = (0.0f64, 0.0f64, 0.0f64);
             if let Some(p) = &self.player {
                 est = p.get_f64("estimated-frame-rate").unwrap_or(0.0);
                 cont = p.get_f64("container-fps").unwrap_or(0.0);
                 vw = p.get_f64("width").unwrap_or(0.0);
                 vh = p.get_f64("height").unwrap_or(0.0);
+                // 丢帧统计：区分「源本身 30fps」和「渲染跟不上丢帧」
+                drops = p.get_f64("frame-drop-count").unwrap_or(0.0);
+                dec_drops = p.get_f64("decoder-frame-drop-count").unwrap_or(0.0);
+                mistimed = p.get_f64("mistimed-frame-count").unwrap_or(0.0);
                 self.source_fps = if est > 0.5 { est as f32 } else { cont as f32 };
             }
             logln!(
-                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 渲染尺寸 {}x{} | rate={} | 弹幕 {}",
+                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 丢帧 输出{:.0}/解码{:.0}/错时{:.0} | 尺寸 {}x{} | rate={} | 弹幕 {}",
                 self.last_fps,
                 if self.source_fps > 0.5 {
                     format!("{:.1}", self.source_fps)
@@ -656,6 +661,9 @@ impl eframe::App for DouyuApp {
                 cont,
                 vw,
                 vh,
+                drops,
+                dec_drops,
+                mistimed,
                 self.frame_w,
                 self.frame_h,
                 self.stream_state.lock().unwrap().1,

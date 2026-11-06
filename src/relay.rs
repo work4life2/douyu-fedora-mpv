@@ -244,6 +244,7 @@ impl Relay {
                 }
                 Ok(None) | Err(_) => {
                     let old_vts = src.video_ts;
+                    logln!("[relay] 当前 CDN 流结束（已转发到 ts={old_vts}），准备接续");
                     let mut new_src = match renewal.take() {
                         Some(s) => s,
                         None => loop {
@@ -256,7 +257,9 @@ impl Relay {
                             }
                         },
                     };
+                    logln!("[relay] 接续新流...");
                     self.splice(&mut new_src, old_vts, &mut stream)?;
+                    logln!("[relay] 接续完成（新流 ts={}）", new_src.video_ts);
                     src = new_src;
                     next_renew = Instant::now() + STREAM_TTL - RENEW_LEAD;
                 }
