@@ -337,12 +337,14 @@ impl DouyuApp {
                 }
             };
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            // 用不透明数据初始化（alpha=255），避免未初始化显存里的脏 alpha
+            // 必须用 sRGB 纹理：egui_glow 的 shader 在 SRGB_TEXTURES 模式下对所有纹理
+            // 做 linear→sRGB 转换。普通 RGBA8 存的是 sRGB 值，会被再转一次 → 发白。
+            // 用 SRGB8_ALPHA8 后：GPU 采样自动 sRGB→linear，shader 再转回 sRGB = 正确。
             let init = vec![0xFFu8; w * h * 4];
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                glow::SRGB8_ALPHA8 as i32,
                 w as i32,
                 h as i32,
                 0,

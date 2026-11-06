@@ -460,8 +460,9 @@ impl MpvPlayer {
                 fbo,
                 w: w as c_int,
                 h: h as c_int,
-                // 明确告知 GL_RGBA8，让 mpv 做正确的色彩输出
-                internal_format: glow::RGBA8 as i32,
+                // 必须是 sRGB 纹理格式：egui_glow 的 shader 编译期按 SRGB_TEXTURES 处理所有纹理，
+                // 普通 RGBA8 会被再转一次 linear→sRGB 导致画面发白。
+                internal_format: glow::SRGB8_ALPHA8 as i32,
             };
             // FBO（非默认 framebuffer）渲染不需要翻转
             let mut flip: c_int = 0;
