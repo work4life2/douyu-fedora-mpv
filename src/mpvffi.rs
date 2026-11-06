@@ -322,8 +322,9 @@ impl MpvPlayer {
                 ("osd-bar", "no"),
                 ("border", "no"),
                 ("cache", "no"),
-                // GL 渲染到 FBO 时强制 sRGB 输出（否则 auto 判定可能输出偏亮/发白）
+                // GL 渲染到 FBO 时强制 sRGB + full range 输出（否则可能偏亮/发灰）
                 ("target-trc", "srgb"),
+                ("video-output-levels", "full"),
             ];
             for (k, v) in opts {
                 let k = CString::new(*k).unwrap();

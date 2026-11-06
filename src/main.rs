@@ -337,6 +337,8 @@ impl DouyuApp {
                 }
             };
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            // 用不透明数据初始化（alpha=255），避免未初始化显存里的脏 alpha
+            let init = vec![0xFFu8; w * h * 4];
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -346,10 +348,16 @@ impl DouyuApp {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                None,
+                Some(&init),
             );
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            // 采样时强制 alpha=1（不透明），彻底忽略 mpv 可能写入的 alpha 通道
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_SWIZZLE_A,
+                glow::ONE as i32,
+            );
             gl.bind_texture(glow::TEXTURE_2D, None);
 
             let fbo = match gl.create_framebuffer() {
