@@ -119,6 +119,7 @@ struct MpvLib {
     #[allow(dead_code)]
     set_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int,
+    get_property: unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
     terminate_destroy: unsafe extern "C" fn(*mut MpvHandle),
     render_context_create: unsafe extern "C" fn(
@@ -164,6 +165,10 @@ impl MpvLib {
             "mpv_command",
             unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int
         );
+        let get_property = get!(
+            "mpv_get_property",
+            unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int
+        );
         let error_string =
             get!("mpv_error_string", unsafe extern "C" fn(c_int) -> *const c_char);
         let terminate_destroy =
@@ -194,6 +199,7 @@ impl MpvLib {
             set_option_string,
             set_property_string,
             command,
+            get_property,
             error_string,
             terminate_destroy,
             render_context_create,
@@ -411,6 +417,26 @@ impl MpvPlayer {
                 Err(err(&self.lib, r))
             } else {
                 Ok(())
+            }
+        }
+    }
+
+    /// 读取 double 类型属性（如 estimated-frame-rate / container-fps）
+    pub fn get_f64(&self, name: &str) -> Option<f64> {
+        unsafe {
+            let n = CString::new(name).ok()?;
+            let mut v: f64 = 0.0;
+            // MPV_FORMAT_DOUBLE = 5
+            let r = (self.lib.get_property)(
+                self.handle,
+                n.as_ptr(),
+                5,
+                &mut v as *mut f64 as *mut c_void,
+            );
+            if r >= 0 {
+                Some(v)
+            } else {
+                None
             }
         }
     }

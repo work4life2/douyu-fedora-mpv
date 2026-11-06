@@ -69,6 +69,12 @@ struct DouyuApp {
     render_err_logged: bool,
     render_ok_logged: bool,
 
+    // 帧率统计
+    frame_count: u32,
+    fps_timer: Instant,
+    last_fps: f32,
+    source_fps: f32,
+
     // 弹幕
     danmaku_on: Arc<AtomicBool>,
     danmaku_stop: Arc<AtomicBool>,
@@ -160,6 +166,10 @@ impl DouyuApp {
             need_frame,
             render_err_logged: false,
             render_ok_logged: false,
+            frame_count: 0,
+            fps_timer: Instant::now(),
+            last_fps: 0.0,
+            source_fps: 0.0,
             danmaku_on: Arc::new(AtomicBool::new(true)),
             danmaku_stop: Arc::new(AtomicBool::new(false)),
             danmaku_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -246,10 +256,11 @@ impl DouyuApp {
         }
     }
 
-    /// 绘制弹幕并移除已出屏的。返回后再统一 retain。
+    /// 绘制弹幕并移除已出屏的。origin 为视频区域左上角（painter_at 不平移坐标，需手动加）。
     fn draw_danmaku(
         &mut self,
         painter: &egui::Painter,
+        origin: egui::Pos2,
         vw: f32,
         vh: f32,
         now: Instant,
@@ -275,7 +286,8 @@ impl DouyuApp {
                 self.danmaku_list.remove(i);
                 continue;
             }
-            let pos = egui::pos2(x, d.row as f32 * row_h + 4.0);
+            // 关键：加上视频区左上角偏移（painter_at 只裁剪不平移）
+            let pos = origin + egui::vec2(x, d.row as f32 * row_h + 4.0);
             let galley = painter.layout_no_wrap(d.text.clone(), font.clone(), egui::Color32::WHITE);
             // 黑描边（四方向）
             for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
@@ -487,6 +499,7 @@ impl eframe::App for DouyuApp {
                     let q = self.stream_state.lock().unwrap().1;
                     for (val, name) in QUALITY_NAMES {
                         if ui.selectable_label(q == *val, *name).clicked() {
+                            eprintln!("[quality] 点击切换: {name} (rate={val})，当前 rate={q}");
                             self.stream_state.lock().unwrap().1 = *val;
                             self.status = format!("已切换到 {name}（无缝）");
                         }
@@ -502,6 +515,21 @@ impl eframe::App for DouyuApp {
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.label(egui::RichText::new(&self.status).small());
+                        if self.last_fps > 0.0 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "渲染 {:.0}fps / 源 {}fps",
+                                    self.last_fps,
+                                    if self.source_fps > 0.5 {
+                                        format!("{:.0}", self.source_fps)
+                                    } else {
+                                        "?".to_string()
+                                    }
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
                     });
                 });
         }
@@ -562,9 +590,9 @@ impl eframe::App for DouyuApp {
                     if resp.double_clicked() {
                         self.toggle_fullscreen(ctx);
                     }
-                    // 弹幕（画在视频区上层，clip 到 rect，坐标相对 rect 左上）
+                    // 弹幕（画在视频区上层，clip 到 rect，坐标需加 rect.min 偏移）
                     let painter = ui.painter_at(rect);
-                    self.draw_danmaku(&painter, vw, vh, Instant::now());
+                    self.draw_danmaku(&painter, rect.min, vw, vh, Instant::now());
                 } else if let Some(e) = &self.lib_err {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(egui::Color32::RED, e);
@@ -583,6 +611,30 @@ impl eframe::App for DouyuApp {
         });
         if toggle {
             self.toggle_fullscreen(ctx);
+        }
+
+        // 帧率统计（每秒一次），同时读取 mpv 源帧率
+        self.frame_count += 1;
+        let fe = self.fps_timer.elapsed();
+        if fe >= Duration::from_secs(1) {
+            self.last_fps = self.frame_count as f32 / fe.as_secs_f32();
+            if let Some(p) = &self.player {
+                if let Some(f) = p.get_f64("estimated-frame-rate") {
+                    self.source_fps = f as f32;
+                }
+            }
+            eprintln!(
+                "[fps] 渲染 {:.1} fps | 源 {} fps | 画质 rate={}",
+                self.last_fps,
+                if self.source_fps > 0.5 {
+                    format!("{:.1}", self.source_fps)
+                } else {
+                    "未知".to_string()
+                },
+                self.stream_state.lock().unwrap().1
+            );
+            self.frame_count = 0;
+            self.fps_timer = Instant::now();
         }
 
         // 播放器存在时持续自驱渲染（60fps，匹配高帧率直播源）
