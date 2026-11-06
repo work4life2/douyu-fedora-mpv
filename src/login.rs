@@ -87,7 +87,8 @@ pub fn poll(code: &str) -> Result<PollState, String> {
                 .as_str()
                 .ok_or("确认成功但缺少回调地址")?
                 .to_string();
-            logln!("[login] 扫码确认，正在换取登录态...");
+            logln!("[login] 扫码已确认，回调地址: {}", short_url(&cb));
+            logln!("[login] 开始换取登录态（逐跳收集 Cookie）...");
             let cookie = exchange_cookie(&cb)?;
             let uid = cookie_value(&cookie, "acf_uid").unwrap_or_default();
             save_cookie(&cookie);
@@ -104,51 +105,120 @@ pub fn poll(code: &str) -> Result<PollState, String> {
     }
 }
 
-/// 跟随登录回调的重定向链，收集所有 Set-Cookie
+/// 跟随登录回调的重定向链，逐跳收集 Set-Cookie。
+/// 要点（对齐 bililive-go）：
+/// - 同名 cookie 后跳覆盖前跳（终点才是权威登录态）
+/// - 跳过空值（空 Set-Cookie 是"清除"语义，不能拿来覆盖真值）
+/// - 每跳记录 URL(脱敏)/状态/cookie 名，失败时输出完整轨迹便于定位
 fn exchange_cookie(start: &str) -> Result<String, String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .try_proxy_from_env(false)
         .build();
-    let mut cookies: Vec<String> = Vec::new();
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut hops: Vec<String> = Vec::new();
     let mut cur = start.to_string();
-    for _ in 0..8 {
-        let resp = agent
+    let mut converged = false;
+
+    for hop in 0..8 {
+        logln!("[login] 回调第 {} 跳: {}", hop + 1, short_url(&cur));
+        // 非 2xx（含 4xx/5xx）也要拿到响应头分析
+        let resp = match agent
             .get(&cur)
             .set("User-Agent", UA)
+            .set("Referer", LOGIN_REFERER)
             .call()
-            .map_err(|e| format!("登录回调请求失败: {e}"))?;
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_code, r)) => r,
+            Err(e) => return Err(format!("回调请求失败: {e}")),
+        };
+        let status = resp.status();
+
+        let mut names: Vec<String> = Vec::new();
         for h in resp.all("set-cookie") {
             if let Some(kv) = h.split(';').next() {
                 let kv = kv.trim();
-                if !kv.is_empty() && !cookies.iter().any(|c| c.starts_with(&format!("{}=", kv.split('=').next().unwrap_or("")))) {
-                    cookies.push(kv.to_string());
+                if let Some(eq) = kv.find('=') {
+                    let (k, v) = (&kv[..eq], &kv[eq + 1..]);
+                    if !v.is_empty() {
+                        seen.insert(k.to_string(), v.to_string());
+                        names.push(k.to_string());
+                    }
                 }
             }
         }
-        let status = resp.status();
+        logln!(
+            "[login]   状态 {status}，cookie: {}",
+            if names.is_empty() {
+                "无".to_string()
+            } else {
+                names.join(",")
+            }
+        );
+        hops.push(format!(
+            "{} -> {} [{}]",
+            short_url(&cur),
+            status,
+            names.join(",")
+        ));
+
         if (300..400).contains(&status) {
             match resp.header("location") {
                 Some(loc) => {
                     cur = resolve_url(&cur, loc);
                     continue;
                 }
-                None => break,
+                None => {
+                    return Err(format!(
+                        "登录回调 {status} 但无 Location，链路中断；轨迹: {}",
+                        hops.join(" | ")
+                    ))
+                }
             }
         }
+        converged = true;
         break;
     }
-    if cookies.is_empty() {
-        return Err("登录回调未返回任何 Cookie".to_string());
+
+    if !converged {
+        return Err(format!("回调 8 跳未到终点；轨迹: {}", hops.join(" | ")));
     }
-    Ok(cookies.join("; "))
+    if seen.is_empty() {
+        return Err(format!("回调未返回任何 Cookie；轨迹: {}", hops.join(" | ")));
+    }
+    logln!(
+        "[login] 登录态字段({}): {}",
+        seen.len(),
+        seen.keys().cloned().collect::<Vec<_>>().join(",")
+    );
+    Ok(seen
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
+/// 只保留 scheme://host/path，隐藏 query（里面有一次性 token，不能进日志）
+fn short_url(u: &str) -> String {
+    if let Some(i) = u.find("://") {
+        let scheme = &u[..i];
+        let rest = &u[i + 3..];
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let host = &rest[..host_end];
+        let path = &rest[host_end..];
+        let path = path.split('?').next().unwrap_or(path);
+        format!("{scheme}://{host}{path}")
+    } else {
+        u.split('?').next().unwrap_or(u).to_string()
+    }
+}
+
+/// 解析重定向 Location（相对路径拼到当前 URL 的 scheme://host 后）
 fn resolve_url(base: &str, loc: &str) -> String {
     if loc.starts_with("http://") || loc.starts_with("https://") {
         return loc.to_string();
     }
-    // 相对路径：拼到 scheme://host 后
     let scheme_host = match base.find("://") {
         Some(i) => match base[i + 3..].find('/') {
             Some(j) => &base[..i + 3 + j],

@@ -126,6 +126,11 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
         .as_secs() as i64;
 
     let did = current_did();
+    logln!(
+        "[stream] 取流请求 rid={rid} quality={quality} 登录态={} did={}…",
+        if crate::login::load_cookie().is_some() { "已登录" } else { "游客" },
+        &did[..did.len().min(10)]
+    );
     let signed = crate::sign::sign(rid, &did, tt, &script)?;
     // cdn 参数影响斗鱼下发的线路/转码：ws-h5（H5 端）可能给 30fps 转码流，
     // ws（PC 网页端）通常给原画原始帧率。可用 DOUYU_CDN 覆盖。
