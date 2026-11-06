@@ -36,13 +36,17 @@ struct GlVideoTarget {
     h: usize,
 }
 
-/// 扫码登录的界面状态
+/// 后台登录线程回传的消息
+enum LoginMsg {
+    Qr(Result<(String, String), String>),
+    Poll(Result<login::PollState, String>),
+}
+
+/// 扫码登录的界面状态（网络请求全部在后台线程，避免卡 UI）
 struct LoginUi {
     qr_tex: Option<egui::TextureHandle>,
     qr_px: usize,
-    code: String,
     status: String,
-    last_poll: Instant,
 }
 
 /// 一条待显示的弹幕（位置由绘制时按出生时间计算）
@@ -91,6 +95,8 @@ struct DouyuApp {
 
     // 登录
     login: Option<LoginUi>,
+    login_rx: Option<mpsc::Receiver<LoginMsg>>,
+    login_stop: Option<Arc<AtomicBool>>,
     logged_in_as: Option<String>,
 
     // 弹幕
@@ -189,6 +195,8 @@ impl DouyuApp {
             last_fps: 0.0,
             source_fps: 0.0,
             login: None,
+            login_rx: None,
+            login_stop: None,
             logged_in_as: login::load_cookie().map(|c| login::nickname(&c)),
             danmaku_on: Arc::new(AtomicBool::new(true)),
             danmaku_stop: Arc::new(AtomicBool::new(false)),
@@ -225,11 +233,8 @@ impl DouyuApp {
         // 换流（relay 检测状态变化无缝切流）+ 播放
         *self.stream_state.lock().unwrap() = (rid.clone(), 0);
         let url = self.relay_url.clone();
-        let player = self.player.as_ref().unwrap().clone();
-        let r = std::thread::spawn(move || player.loadfile(&url))
-            .join()
-            .unwrap_or_else(|_| Err("loadfile 线程失败".into()));
-        if let Err(e) = r {
+        // 直接调用（mpv_command 本身很快，不要 spawn+join 阻塞 UI 线程）
+        if let Err(e) = self.player.as_ref().unwrap().loadfile(&url) {
             self.status = format!("加载失败: {e}");
             return;
         }
@@ -252,59 +257,149 @@ impl DouyuApp {
         self.status = format!("正在播放房间 {rid}");
     }
 
-    /// 打开扫码登录：生成二维码并显示
+    /// 打开扫码登录：起后台线程生成二维码 + 轮询（绝不阻塞 UI 线程）
     fn open_login(&mut self, ctx: &egui::Context) {
-        match login::generate() {
-            Ok(sess) => {
-                let (tex, px) = make_qr_texture(ctx, &sess.url);
-                self.login = Some(LoginUi {
-                    qr_tex: tex,
-                    qr_px: px,
-                    code: sess.code,
-                    status: "等待扫码…".to_string(),
-                    // 让它立刻轮询一次
-                    last_poll: Instant::now() - Duration::from_secs(10),
-                });
-            }
-            Err(e) => {
-                self.status = format!("获取二维码失败: {e}");
-            }
+        // 停掉上一个会话
+        if let Some(st) = self.login_stop.take() {
+            st.store(true, Ordering::Relaxed);
         }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.login_stop = Some(stop.clone());
+        let (tx, rx) = mpsc::channel();
+        self.login_rx = Some(rx);
+        self.login = Some(LoginUi {
+            qr_tex: None,
+            qr_px: 0,
+            status: "正在获取二维码…".to_string(),
+        });
+
+        std::thread::spawn(move || {
+            // 1) 生成二维码
+            let sess = match login::generate() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(LoginMsg::Qr(Err(e)));
+                    return;
+                }
+            };
+            if tx
+                .send(LoginMsg::Qr(Ok((sess.code.clone(), sess.url.clone()))))
+                .is_err()
+            {
+                return;
+            }
+            // 2) 轮询循环（2 秒一次，分片 sleep 便于及时停止）
+            loop {
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match login::poll(&sess.code) {
+                    Ok(st) => {
+                        let done = matches!(
+                            st,
+                            login::PollState::Success(_)
+                                | login::PollState::Expired
+                                | login::PollState::Rejected
+                        );
+                        let desc = match &st {
+                            login::PollState::Waiting => "等待扫码",
+                            login::PollState::Scanned => "已扫待确认",
+                            login::PollState::Success(_) => "成功",
+                            login::PollState::Expired => "已过期",
+                            login::PollState::Rejected => "已取消",
+                        };
+                        logln!("[login] 轮询: {desc}");
+                        if tx.send(LoginMsg::Poll(Ok(st))).is_err() {
+                            return;
+                        }
+                        if done {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        if tx.send(LoginMsg::Poll(Err(e))).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        // 让 egui 持续重绘以处理回传消息
+        ctx.request_repaint();
     }
 
-    /// 每 2 秒轮询一次扫码状态
-    fn poll_login(&mut self) {
-        let code = match &self.login {
-            Some(l) if l.last_poll.elapsed() >= Duration::from_secs(2) => l.code.clone(),
-            _ => return,
+    /// 处理后台登录线程的消息（非阻塞）
+    fn poll_login(&mut self, ctx: &egui::Context) {
+        let msgs: Vec<LoginMsg> = match &self.login_rx {
+            Some(rx) => {
+                let mut v = Vec::new();
+                while let Ok(m) = rx.try_recv() {
+                    v.push(m);
+                }
+                v
+            }
+            None => return,
         };
-        if let Some(l) = &mut self.login {
-            l.last_poll = Instant::now();
+        let mut finished = false;
+        for m in msgs {
+            match m {
+                LoginMsg::Qr(Ok((_code, url))) => {
+                    let (tex, px) = make_qr_texture(ctx, &url);
+                    if let Some(l) = &mut self.login {
+                        l.qr_tex = tex;
+                        l.qr_px = px;
+                        l.status = "等待扫码…".to_string();
+                    }
+                }
+                LoginMsg::Qr(Err(e)) => {
+                    if let Some(l) = &mut self.login {
+                        l.status = format!("获取二维码失败: {e}");
+                    }
+                }
+                LoginMsg::Poll(Ok(login::PollState::Success(cookie))) => {
+                    let nick = login::nickname(&cookie);
+                    self.logged_in_as = Some(nick.clone());
+                    self.status = format!("已登录「{nick}」，重新加载房间即可看原画");
+                    finished = true;
+                }
+                LoginMsg::Poll(Ok(st)) => {
+                    let txt = match st {
+                        login::PollState::Waiting => "等待扫码…",
+                        login::PollState::Scanned => "已扫码，请在手机上点确认",
+                        login::PollState::Expired => "二维码已过期，点「刷新」",
+                        login::PollState::Rejected => "已取消登录",
+                        login::PollState::Success(_) => "",
+                    };
+                    if let Some(l) = &mut self.login {
+                        l.status = txt.to_string();
+                        if matches!(st, login::PollState::Expired | login::PollState::Rejected) {
+                            // 保留弹窗让用户点刷新
+                        }
+                    }
+                }
+                LoginMsg::Poll(Err(e)) => {
+                    if let Some(l) = &mut self.login {
+                        l.status = format!("轮询出错: {e}");
+                    }
+                }
+            }
         }
-        match login::poll(&code) {
-            Ok(login::PollState::Success(cookie)) => {
-                let nick = login::nickname(&cookie);
-                self.logged_in_as = Some(nick.clone());
-                self.login = None;
-                self.status = format!("已登录「{nick}」，重新加载房间即可看原画");
+        if finished {
+            self.login = None;
+            self.login_rx = None;
+            if let Some(st) = self.login_stop.take() {
+                st.store(true, Ordering::Relaxed);
             }
-            Ok(st) => {
-                let txt = match st {
-                    login::PollState::Waiting => "等待扫码…",
-                    login::PollState::Scanned => "已扫码，请在手机上点确认",
-                    login::PollState::Expired => "二维码已过期，点「刷新」",
-                    login::PollState::Rejected => "已取消登录",
-                    login::PollState::Success(_) => "",
-                };
-                if let Some(l) = &mut self.login {
-                    l.status = txt.to_string();
-                }
-            }
-            Err(e) => {
-                if let Some(l) = &mut self.login {
-                    l.status = format!("轮询出错: {e}");
-                }
-            }
+        }
+        // 登录弹窗打开期间保持刷新（让后台消息及时处理）
+        if self.login.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -715,7 +810,7 @@ impl eframe::App for DouyuApp {
         }
 
         // 扫码登录：轮询状态 + 二维码弹窗
-        self.poll_login();
+        self.poll_login(ctx);
         let mut close_login = false;
         let mut refresh_login = false;
         if let Some(lg) = &self.login {
@@ -746,11 +841,14 @@ impl eframe::App for DouyuApp {
                 });
         }
         if refresh_login {
-            self.login = None;
             self.open_login(ctx);
         }
         if close_login {
+            if let Some(st) = self.login_stop.take() {
+                st.store(true, Ordering::Relaxed);
+            }
             self.login = None;
+            self.login_rx = None;
         }
 
         // 帧率统计（每秒一次），同时读取 mpv 源帧率和视频参数
