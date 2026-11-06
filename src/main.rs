@@ -97,6 +97,8 @@ struct DouyuApp {
     login: Option<LoginUi>,
     login_rx: Option<mpsc::Receiver<LoginMsg>>,
     login_stop: Option<Arc<AtomicBool>>,
+    /// 手动粘贴 Cookie 弹窗的内容（None=关闭）
+    cookie_input: Option<String>,
     logged_in_as: Option<String>,
 
     // 弹幕
@@ -197,6 +199,7 @@ impl DouyuApp {
             login: None,
             login_rx: None,
             login_stop: None,
+            cookie_input: None,
             logged_in_as: login::load_cookie().map(|c| login::nickname(&c)),
             danmaku_on: Arc::new(AtomicBool::new(true)),
             danmaku_stop: Arc::new(AtomicBool::new(false)),
@@ -323,6 +326,7 @@ impl DouyuApp {
                         }
                     }
                     Err(e) => {
+                        logln!("[login] 轮询/换票失败: {e}");
                         if tx.send(LoginMsg::Poll(Err(e))).is_err() {
                             return;
                         }
@@ -707,6 +711,9 @@ impl eframe::App for DouyuApp {
                             if ui.button("扫码登录").clicked() {
                                 self.open_login(ctx);
                             }
+                            if ui.button("手动粘贴 Cookie").clicked() {
+                                self.cookie_input = Some(String::new());
+                            }
                         }
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -807,6 +814,52 @@ impl eframe::App for DouyuApp {
         });
         if toggle {
             self.toggle_fullscreen(ctx);
+        }
+
+        // 手动粘贴 Cookie 兜底
+        let mut close_cookie = false;
+        let mut save_cookie_now = false;
+        if let Some(input) = &mut self.cookie_input {
+            egui::Window::new("手动粘贴 Cookie")
+                .collapsible(false)
+                .resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("从已登录斗鱼网页的浏览器里复制 Cookie：F12 → Network → 任意 douyu.com 请求 → 复制 Cookie 请求头");
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(input)
+                            .desired_rows(6)
+                            .desired_width(560.0)
+                            .hint_text("acf_uid=...; acf_auth=...; ..."),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("保存并登录").clicked() {
+                            save_cookie_now = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            close_cookie = true;
+                        }
+                    });
+                });
+        }
+        if save_cookie_now {
+            if let Some(raw) = self.cookie_input.clone() {
+                match login::normalize_cookie(&raw) {
+                    Ok(c) => {
+                        login::save_cookie(&c);
+                        self.logged_in_as = login::load_cookie().map(|c| login::nickname(&c));
+                        self.status = "Cookie 已保存，重新加载房间即可看原画".to_string();
+                        self.cookie_input = None;
+                    }
+                    Err(e) => {
+                        self.status = format!("Cookie 无效: {e}");
+                    }
+                }
+            }
+        }
+        if close_cookie {
+            self.cookie_input = None;
         }
 
         // 扫码登录：轮询状态 + 二维码弹窗

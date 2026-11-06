@@ -131,7 +131,10 @@ fn exchange_cookie(start: &str) -> Result<String, String> {
         {
             Ok(r) => r,
             Err(ureq::Error::Status(_code, r)) => r,
-            Err(e) => return Err(format!("回调请求失败: {e}")),
+            Err(e) => {
+                logln!("[login]   第 {} 跳请求失败: {e}", hop + 1);
+                return Err(format!("回调请求失败: {e}"));
+            }
         };
         let status = resp.status();
 
@@ -199,18 +202,34 @@ fn exchange_cookie(start: &str) -> Result<String, String> {
         .join("; "))
 }
 
-/// 只保留 scheme://host/path，隐藏 query（里面有一次性 token，不能进日志）
+/// 保留 scheme://host/path + 参数名，参数值打码（一次性 token 不能进日志）
 fn short_url(u: &str) -> String {
-    if let Some(i) = u.find("://") {
-        let scheme = &u[..i];
-        let rest = &u[i + 3..];
+    let (base, query) = match u.find('?') {
+        Some(i) => (&u[..i], Some(&u[i + 1..])),
+        None => (u, None),
+    };
+    let masked_base = if let Some(i) = base.find("://") {
+        let scheme = &base[..i];
+        let rest = &base[i + 3..];
         let host_end = rest.find('/').unwrap_or(rest.len());
-        let host = &rest[..host_end];
-        let path = &rest[host_end..];
-        let path = path.split('?').next().unwrap_or(path);
-        format!("{scheme}://{host}{path}")
+        format!("{scheme}://{}", &rest[..host_end.max(1).min(rest.len())])
+            .to_string()
+            + &rest[host_end..]
     } else {
-        u.split('?').next().unwrap_or(u).to_string()
+        base.to_string()
+    };
+    match query {
+        Some(q) if !q.is_empty() => {
+            let names: Vec<String> = q
+                .split('&')
+                .map(|kv| {
+                    let k = kv.split('=').next().unwrap_or(kv);
+                    format!("{k}=***")
+                })
+                .collect();
+            format!("{masked_base}?{}", names.join("&"))
+        }
+        _ => masked_base,
     }
 }
 
@@ -259,7 +278,7 @@ pub fn load_cookie() -> Option<String> {
     }
 }
 
-fn save_cookie(c: &str) {
+pub fn save_cookie(c: &str) {
     if let Some(p) = cookie_path() {
         if std::fs::write(&p, c).is_ok() {
             logln!("[login] cookie 已写入 {}", p.display());
@@ -307,4 +326,19 @@ pub fn save_png(rgba: &[u8], size: usize, filename: &str) -> Result<PathBuf, Str
         .write_image_data(rgba)
         .map_err(|e| format!("PNG 数据写入失败: {e}"))?;
     Ok(path)
+}
+
+/// 规范化用户粘贴的 Cookie：去换行、合并多余空格，并校验含关键字段
+pub fn normalize_cookie(raw: &str) -> Result<String, String> {
+    let joined = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = joined.replace("; ", "; ").replace(";;", ";");
+    if cookie_value(&cleaned, "acf_uid").is_none() {
+        return Err("缺少 acf_uid，请从已登录的斗鱼网页复制完整 Cookie 请求头".into());
+    }
+    Ok(cleaned)
 }
