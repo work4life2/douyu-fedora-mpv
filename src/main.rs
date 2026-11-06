@@ -9,6 +9,7 @@
 
 mod danmaku;
 mod douyu;
+mod log;
 mod mpvffi;
 mod relay;
 mod sign;
@@ -39,6 +40,9 @@ struct Danmaku {
     text: String,
     row: usize,
     spawn: Instant,
+    /// 缓存的文字排版结果（避免每帧重复 layout，这是 60fps 掉 30fps 的主因）
+    galley: Option<std::sync::Arc<egui::Galley>>,
+    galley_size: f32,
 }
 
 struct DouyuApp {
@@ -92,7 +96,7 @@ impl DouyuApp {
         let relay_url = match relay::Relay::new(stream_state.clone()).start() {
             Ok(p) => format!("http://127.0.0.1:{p}/live.flv"),
             Err(e) => {
-                eprintln!("启动中转失败: {e}");
+                logln!("启动中转失败: {e}");
                 String::new()
             }
         };
@@ -108,7 +112,7 @@ impl DouyuApp {
             let fc = first_cb.clone();
             Box::new(move || {
                 if !fc.swap(true, Ordering::Relaxed) {
-                    eprintln!("[video] mpv 帧回调已激活");
+                    logln!("[video] mpv 帧回调已激活");
                 }
                 nf.store(true, Ordering::Relaxed);
                 ctx2.request_repaint();
@@ -118,15 +122,15 @@ impl DouyuApp {
         let (player, gl) = if let Some(g) = cc.gl.clone() {
             match mpvffi::MpvPlayer::new_opengl(make_cb()) {
                 Ok(p) => {
-                    eprintln!("[video] 使用 OpenGL 零拷贝渲染");
+                    logln!("[video] 使用 OpenGL 零拷贝渲染");
                     (Some(Arc::new(p)), Some(g))
                 }
                 Err(e) => {
-                    eprintln!("[video] OpenGL 渲染初始化失败，回退软件渲染: {e}");
+                    logln!("[video] OpenGL 渲染初始化失败，回退软件渲染: {e}");
                     match mpvffi::MpvPlayer::new(make_cb()) {
                         Ok(p) => (Some(Arc::new(p)), None),
                         Err(e2) => {
-                            eprintln!("{e2}");
+                            logln!("{e2}");
                             (None, None)
                         }
                     }
@@ -136,7 +140,7 @@ impl DouyuApp {
             match mpvffi::MpvPlayer::new(make_cb()) {
                 Ok(p) => (Some(Arc::new(p)), None),
                 Err(e) => {
-                    eprintln!("{e}");
+                    logln!("{e}");
                     (None, None)
                 }
             }
@@ -242,8 +246,8 @@ impl DouyuApp {
             if txt.trim().is_empty() {
                 continue;
             }
-            // 限制数量，防止弹幕海量堆积
-            if self.danmaku_list.len() > 300 {
+            // 限制数量，防止弹幕海量堆积（屏幕同步可见的不会超过几十条）
+            if self.danmaku_list.len() > 60 {
                 self.danmaku_list.remove(0);
             }
             let row = (self.next_danmaku_row % 13) as usize;
@@ -252,6 +256,8 @@ impl DouyuApp {
                 text: txt,
                 row,
                 spawn: Instant::now(),
+                galley: None,
+                galley_size: 0.0,
             });
         }
     }
@@ -276,27 +282,33 @@ impl DouyuApp {
 
         let mut i = 0;
         while i < self.danmaku_list.len() {
-            let d = &self.danmaku_list[i];
-            let elapsed = now.duration_since(d.spawn).as_secs_f32();
+            let (text, row, spawn) = {
+                let d = &self.danmaku_list[i];
+                (d.text.clone(), d.row, d.spawn)
+            };
+            let elapsed = now.duration_since(spawn).as_secs_f32();
             // 文本左上角 x：从右边缘进入，向左移动
             let x = vw - elapsed * speed;
             // 估算文本宽度（用于判断出屏）
-            let text_w = d.text.chars().count() as f32 * font_size * 0.92;
+            let text_w = text.chars().count() as f32 * font_size * 0.92;
             if x + text_w < 0.0 {
                 self.danmaku_list.remove(i);
                 continue;
             }
+            // 排版结果缓存：每条弹幕只 layout 一次（字号变化才重建）
+            let galley = {
+                let d = &mut self.danmaku_list[i];
+                if d.galley.is_none() || (d.galley_size - font_size).abs() > 0.5 {
+                    d.galley =
+                        Some(painter.layout_no_wrap(d.text.clone(), font.clone(), egui::Color32::WHITE));
+                    d.galley_size = font_size;
+                }
+                d.galley.clone().unwrap()
+            };
             // 关键：加上视频区左上角偏移（painter_at 只裁剪不平移）
-            let pos = origin + egui::vec2(x, d.row as f32 * row_h + 4.0);
-            let galley = painter.layout_no_wrap(d.text.clone(), font.clone(), egui::Color32::WHITE);
-            // 黑描边（四方向）
-            for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                painter.galley(
-                    pos + egui::vec2(dx, dy),
-                    galley.clone(),
-                    egui::Color32::BLACK,
-                );
-            }
+            let pos = origin + egui::vec2(x, row as f32 * row_h + 4.0);
+            // 描边 2 次（对角偏移）而非 4 次，减半绘制开销
+            painter.galley(pos + egui::vec2(1.0, 1.0), galley.clone(), egui::Color32::BLACK);
             painter.galley(pos, galley, egui::Color32::WHITE);
             i += 1;
         }
@@ -315,13 +327,13 @@ impl DouyuApp {
         if let Err(e) = player.render_sw(w, h, &mut self.frame_buf) {
             if !self.render_err_logged {
                 self.render_err_logged = true;
-                eprintln!("[video] 渲染失败（只报一次）: {e}");
+                logln!("[video] 渲染失败（只报一次）: {e}");
             }
             return;
         }
         if !self.render_ok_logged {
             self.render_ok_logged = true;
-            eprintln!("[video] 首帧渲染成功 {}x{}", w, h);
+            logln!("[video] 首帧渲染成功 {}x{}", w, h);
         }
         self.frame_w = w;
         self.frame_h = h;
@@ -344,7 +356,7 @@ impl DouyuApp {
             let texture = match gl.create_texture() {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("[video] 创建纹理失败: {e}");
+                    logln!("[video] 创建纹理失败: {e}");
                     return;
                 }
             };
@@ -377,7 +389,7 @@ impl DouyuApp {
             let fbo = match gl.create_framebuffer() {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("[video] 创建 FBO 失败: {e}");
+                    logln!("[video] 创建 FBO 失败: {e}");
                     gl.delete_texture(texture);
                     return;
                 }
@@ -393,7 +405,7 @@ impl DouyuApp {
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             if status != glow::FRAMEBUFFER_COMPLETE {
-                eprintln!("[video] FBO 不完整: 0x{status:x}");
+                logln!("[video] FBO 不完整: 0x{status:x}");
                 gl.delete_framebuffer(fbo);
                 gl.delete_texture(texture);
                 return;
@@ -429,6 +441,12 @@ impl DouyuApp {
             self.recreate_gl_target(&gl, w, h, frame);
         }
 
+        // 只在 mpv 有新帧时渲染（无新帧复用上一帧纹理，避免 GPU 空转）
+        let new_frame = self.need_frame.swap(false, Ordering::Relaxed);
+        if !new_frame && !need_recreate {
+            return;
+        }
+
         let fbo = match &self.gl_video {
             Some(t) => t.fbo,
             None => return,
@@ -436,13 +454,13 @@ impl DouyuApp {
         if let Err(e) = player.render_gl(fbo.0.get() as i32, w, h) {
             if !self.render_err_logged {
                 self.render_err_logged = true;
-                eprintln!("[video] GL 渲染失败（只报一次）: {e}");
+                logln!("[video] GL 渲染失败（只报一次）: {e}");
             }
             return;
         }
         if !self.render_ok_logged {
             self.render_ok_logged = true;
-            eprintln!("[video] GL 首帧渲染成功 {}x{}", w, h);
+            logln!("[video] GL 首帧渲染成功 {}x{}", w, h);
         }
         self.frame_w = w;
         self.frame_h = h;
@@ -499,7 +517,7 @@ impl eframe::App for DouyuApp {
                     let q = self.stream_state.lock().unwrap().1;
                     for (val, name) in QUALITY_NAMES {
                         if ui.selectable_label(q == *val, *name).clicked() {
-                            eprintln!("[quality] 点击切换: {name} (rate={val})，当前 rate={q}");
+                            logln!("[quality] 点击切换: {name} (rate={val})，当前 rate={q}");
                             self.stream_state.lock().unwrap().1 = *val;
                             self.status = format!("已切换到 {name}（无缝）");
                         }
@@ -613,25 +631,35 @@ impl eframe::App for DouyuApp {
             self.toggle_fullscreen(ctx);
         }
 
-        // 帧率统计（每秒一次），同时读取 mpv 源帧率
+        // 帧率统计（每秒一次），同时读取 mpv 源帧率和视频参数
         self.frame_count += 1;
         let fe = self.fps_timer.elapsed();
         if fe >= Duration::from_secs(1) {
             self.last_fps = self.frame_count as f32 / fe.as_secs_f32();
+            let (mut est, mut cont, mut vw, mut vh) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             if let Some(p) = &self.player {
-                if let Some(f) = p.get_f64("estimated-frame-rate") {
-                    self.source_fps = f as f32;
-                }
+                est = p.get_f64("estimated-frame-rate").unwrap_or(0.0);
+                cont = p.get_f64("container-fps").unwrap_or(0.0);
+                vw = p.get_f64("width").unwrap_or(0.0);
+                vh = p.get_f64("height").unwrap_or(0.0);
+                self.source_fps = if est > 0.5 { est as f32 } else { cont as f32 };
             }
-            eprintln!(
-                "[fps] 渲染 {:.1} fps | 源 {} fps | 画质 rate={}",
+            logln!(
+                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 渲染尺寸 {}x{} | rate={} | 弹幕 {}",
                 self.last_fps,
                 if self.source_fps > 0.5 {
                     format!("{:.1}", self.source_fps)
                 } else {
                     "未知".to_string()
                 },
-                self.stream_state.lock().unwrap().1
+                est,
+                cont,
+                vw,
+                vh,
+                self.frame_w,
+                self.frame_h,
+                self.stream_state.lock().unwrap().1,
+                self.danmaku_list.len()
             );
             self.frame_count = 0;
             self.fps_timer = Instant::now();
@@ -681,6 +709,9 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 fn main() {
+    log::init();
+    logln!("=== douyu v{} 启动 ===", env!("CARGO_PKG_VERSION"));
+
     // 调试命令（不影响双击启动）
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 {
@@ -724,7 +755,7 @@ fn cmd_danmaku_test(rest: &[String]) {
                 n += 1;
             }
             Err(e) => {
-                eprintln!("40 秒内未收到弹幕（{e}）");
+                logln!("40 秒内未收到弹幕（{e}）");
                 break;
             }
         }

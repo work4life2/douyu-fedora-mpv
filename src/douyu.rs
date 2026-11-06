@@ -3,6 +3,7 @@
 
 #![allow(dead_code)] // room_info/list 等供未来扩展，GUI 版暂未使用
 
+use crate::logln;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,6 +131,16 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
         None => return Err("该房间未开播或不可用".to_string()),
     };
     let url = format!("{}/{}", d.rtmp_url.trim_end_matches('/'), d.rtmp_live);
+    // 日志只记录主机部分（避免 token 刷屏，也不泄露完整鉴权串）
+    let host = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+    logln!(
+        "[stream] 取流成功 rid={rid} quality={quality} host={host} 档位={}",
+        d.multirates
+            .iter()
+            .map(|r| format!("{}:{}", r.rate, r.name))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     Ok(Stream {
         url,
         rates: d.multirates,

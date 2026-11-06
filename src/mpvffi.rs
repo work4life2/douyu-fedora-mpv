@@ -12,6 +12,7 @@ use libloading::Library;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Arc;
+use crate::logln;
 
 // mpv_render_param_type 枚举值（mpv/render.h）
 const MPV_RENDER_PARAM_INVALID: c_int = 0;
@@ -342,6 +343,14 @@ impl MpvPlayer {
             if r < 0 {
                 return Err(format!("mpv_initialize 失败: {}", err(&lib, r)));
             }
+
+            // render API 模式下 mpv 无法感知显示器刷新率，会保守按低帧率调度。
+            // 显式告知显示刷新率（默认 60，可用 DOUYU_DISPLAY_FPS 覆盖）。
+            let fps = std::env::var("DOUYU_DISPLAY_FPS").unwrap_or_else(|_| "60".to_string());
+            let k = CString::new("display-fps").unwrap();
+            let v = CString::new(fps.clone()).unwrap();
+            let r = (lib.set_property_string)(handle, k.as_ptr(), v.as_ptr());
+            logln!("[mpv] display-fps 设为 {fps}（ret={r}）");
 
             // OpenGL 渲染上下文：API_TYPE="opengl" + OPENGL_INIT_PARAMS(get_proc_address)
             let loader = Arc::new(GlLoader::load());

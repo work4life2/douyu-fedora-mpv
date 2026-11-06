@@ -16,6 +16,7 @@ use native_tls::{Protocol, TlsConnector};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
+use crate::logln;
 
 type WsStream = MaybeTlsStream<TcpStream>;
 
@@ -105,7 +106,7 @@ pub fn run(rid: String, stop: Arc<AtomicBool>, tx: Sender<Chat>) {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    eprintln!("[danmaku] 断开: {e}，3 秒后重连");
+                    logln!("[danmaku] 断开: {e}，3 秒后重连");
                 } else {
                     return; // 主动停止
                 }
@@ -114,7 +115,7 @@ pub fn run(rid: String, stop: Arc<AtomicBool>, tx: Sender<Chat>) {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                eprintln!("[danmaku] {e}，3 秒后重连");
+                logln!("[danmaku] {e}，3 秒后重连");
             }
         }
         for _ in 0..30 {

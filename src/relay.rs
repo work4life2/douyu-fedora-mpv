@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use crate::logln;
 
 const FLV_HEADER: [u8; 9] = [b'F', b'L', b'V', 1, 0b0000_0101, 0, 0, 0, 9];
 /// FLV header 后紧跟的 PreviousTagSize0（恒为 0）
@@ -150,7 +151,7 @@ impl Relay {
             for conn in listener.incoming() {
                 if let Ok(stream) = conn {
                     if let Err(e) = self.handle(stream) {
-                        eprintln!("[relay] 连接结束: {e}");
+                        logln!("[relay] 连接结束: {e}");
                     }
                 }
             }
@@ -164,6 +165,7 @@ impl Relay {
     }
 
     fn handle(&self, mut stream: TcpStream) -> Result<(), String> {
+        logln!("[relay] 播放器已连接");
         // 读 HTTP 请求头
         let mut buf = [0u8; 4096];
         let mut req = Vec::new();
@@ -203,7 +205,7 @@ impl Relay {
             // 房间/画质变化 → 无缝切流
             let want = self.state.lock().unwrap().clone();
             if want != current && !want.0.is_empty() {
-                eprintln!(
+                logln!(
                     "[relay] 切流: rid={}\u{2192}{}, quality={}\u{2192}{}",
                     current.0, want.0, current.1, want.1
                 );
@@ -219,7 +221,7 @@ impl Relay {
                         next_renew = Instant::now() + STREAM_TTL - RENEW_LEAD;
                         continue;
                     }
-                    Err(e) => eprintln!("[relay] 切流失败: {e}"),
+                    Err(e) => logln!("[relay] 切流失败: {e}"),
                 }
             }
 
@@ -227,7 +229,7 @@ impl Relay {
             if renewal.is_none() && Instant::now() >= next_renew {
                 match self.fetch(&current.0, current.1) {
                     Ok(s) => renewal = Some(s),
-                    Err(e) => eprintln!("[relay] 预取失败: {e}"),
+                    Err(e) => logln!("[relay] 预取失败: {e}"),
                 }
             }
 
@@ -248,7 +250,7 @@ impl Relay {
                             match self.fetch(&current.0, current.1) {
                                 Ok(s) => break s,
                                 Err(e) => {
-                                    eprintln!("[relay] 重连失败: {e}");
+                                    logln!("[relay] 重连失败: {e}");
                                     std::thread::sleep(RETRY_DELAY);
                                 }
                             }
@@ -282,7 +284,7 @@ impl Relay {
                 } else {
                     discarded += tag.data.len() + 15;
                     if discarded > 3_000_000 {
-                        eprintln!(
+                        logln!(
                             "[relay] splice 丢弃 {discarded}B 仍未找到关键帧，直接转发（时间戳可能已重置）"
                         );
                         started = true;
