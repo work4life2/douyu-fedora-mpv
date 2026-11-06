@@ -203,6 +203,10 @@ impl Relay {
             // 房间/画质变化 → 无缝切流
             let want = self.state.lock().unwrap().clone();
             if want != current && !want.0.is_empty() {
+                eprintln!(
+                    "[relay] 切流: rid={}\u{2192}{}, quality={}\u{2192}{}",
+                    current.0, want.0, current.1, want.1
+                );
                 current = want;
                 let old_vts = src.video_ts;
                 match crate::douyu::get_stream(&current.0, current.1)
@@ -258,7 +262,8 @@ impl Relay {
         }
     }
 
-    /// 接续：丢弃 script/seq header/已过期 tag，从视频关键帧接上
+    /// 接续：丢弃 script/seq header/已过期 tag，从视频关键帧接上。
+    /// 保护：若丢弃超过 3MB 仍未找到关键帧（时间戳可能重置），放弃过滤直接转发。
     fn splice(
         &self,
         new_src: &mut FlvSource,
@@ -266,6 +271,7 @@ impl Relay {
         stream: &mut TcpStream,
     ) -> Result<(), String> {
         let mut started = false;
+        let mut discarded: usize = 0;
         while let Some(tag) = new_src.read_tag()? {
             if tag.is_script() || tag.is_sequence_header() {
                 continue;
@@ -274,7 +280,15 @@ impl Relay {
                 if tag.is_video() && tag.is_keyframe() && tag.timestamp > old_video_ts {
                     started = true;
                 } else {
-                    continue;
+                    discarded += tag.data.len() + 15;
+                    if discarded > 3_000_000 {
+                        eprintln!(
+                            "[relay] splice 丢弃 {discarded}B 仍未找到关键帧，直接转发（时间戳可能已重置）"
+                        );
+                        started = true;
+                    } else {
+                        continue;
+                    }
                 }
             }
             if tag.is_video() {

@@ -7,6 +7,7 @@
 //! 硬解：OpenGL 模式用 hwdec=nvdec-copy（GPU 解码拷回，mpv GL 渲染），
 //!       渲染结果零拷贝给 egui。
 
+use eframe::glow;
 use libloading::Library;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -321,6 +322,8 @@ impl MpvPlayer {
                 ("osd-bar", "no"),
                 ("border", "no"),
                 ("cache", "no"),
+                // GL 渲染到 FBO 时强制 sRGB 输出（否则 auto 判定可能输出偏亮/发白）
+                ("target-trc", "srgb"),
             ];
             for (k, v) in opts {
                 let k = CString::new(*k).unwrap();
@@ -456,7 +459,8 @@ impl MpvPlayer {
                 fbo,
                 w: w as c_int,
                 h: h as c_int,
-                internal_format: 0,
+                // 明确告知 GL_RGBA8，让 mpv 做正确的色彩输出
+                internal_format: glow::RGBA8 as i32,
             };
             // FBO（非默认 framebuffer）渲染不需要翻转
             let mut flip: c_int = 0;
