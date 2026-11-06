@@ -19,10 +19,20 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use eframe::glow::{self, HasContext};
 
 const QUALITY_NAMES: &[(i32, &str)] = &[(0, "原画"), (4, "蓝光4M"), (3, "超清"), (2, "高清")];
 
 type Chat = (String, String);
+
+/// OpenGL 渲染目标：FBO + 绑定的纹理 + 注册给 egui 的 TextureId
+struct GlVideoTarget {
+    texture: glow::Texture,
+    fbo: glow::Framebuffer,
+    tex_id: egui::TextureId,
+    w: usize,
+    h: usize,
+}
 
 /// 一条待显示的弹幕（位置由绘制时按出生时间计算）
 struct Danmaku {
@@ -44,7 +54,11 @@ struct DouyuApp {
     player: Option<Arc<mpvffi::MpvPlayer>>,
     lib_err: Option<String>,
 
-    // 视频纹理
+    // OpenGL 渲染（零拷贝）；None 表示回退软件渲染
+    gl: Option<Arc<glow::Context>>,
+    gl_video: Option<GlVideoTarget>,
+
+    // 视频纹理（GL 模式用 gl_video.tex_id，SW 模式用 video_tex）
     video_tex: Option<egui::TextureHandle>,
     frame_buf: Vec<u8>,
     frame_w: usize,
@@ -77,25 +91,51 @@ impl DouyuApp {
             }
         };
 
-        // libmpv 播放器（启动即创建，换房只 loadfile）
+        // libmpv 播放器（启动即创建，换房只 loadfile）。优先 OpenGL 渲染，失败回退软件渲染。
         let need_frame = Arc::new(AtomicBool::new(false));
         let ctx2 = cc.egui_ctx.clone();
         let nf = need_frame.clone();
         let first_cb = Arc::new(AtomicBool::new(false));
-        let fc = first_cb.clone();
-        let player = match mpvffi::MpvPlayer::new(Box::new(move || {
-            if !fc.swap(true, Ordering::Relaxed) {
-                eprintln!("[video] mpv 帧回调已激活");
+        let make_cb = || -> Box<dyn Fn() + Send> {
+            let nf = nf.clone();
+            let ctx2 = ctx2.clone();
+            let fc = first_cb.clone();
+            Box::new(move || {
+                if !fc.swap(true, Ordering::Relaxed) {
+                    eprintln!("[video] mpv 帧回调已激活");
+                }
+                nf.store(true, Ordering::Relaxed);
+                ctx2.request_repaint();
+            })
+        };
+
+        let (player, gl) = if let Some(g) = cc.gl.clone() {
+            match mpvffi::MpvPlayer::new_opengl(make_cb()) {
+                Ok(p) => {
+                    eprintln!("[video] 使用 OpenGL 零拷贝渲染");
+                    (Some(Arc::new(p)), Some(g))
+                }
+                Err(e) => {
+                    eprintln!("[video] OpenGL 渲染初始化失败，回退软件渲染: {e}");
+                    match mpvffi::MpvPlayer::new(make_cb()) {
+                        Ok(p) => (Some(Arc::new(p)), None),
+                        Err(e2) => {
+                            eprintln!("{e2}");
+                            (None, None)
+                        }
+                    }
+                }
             }
-            nf.store(true, Ordering::Relaxed);
-            ctx2.request_repaint();
-        })) {
-            Ok(p) => Some(Arc::new(p)),
-            Err(e) => {
-                eprintln!("{e}");
-                None
+        } else {
+            match mpvffi::MpvPlayer::new(make_cb()) {
+                Ok(p) => (Some(Arc::new(p)), None),
+                Err(e) => {
+                    eprintln!("{e}");
+                    (None, None)
+                }
             }
         };
+
         let lib_err = if player.is_none() {
             Some("libmpv 加载失败，请安装: sudo dnf install mpv-libs".to_string())
         } else {
@@ -110,6 +150,8 @@ impl DouyuApp {
             relay_url,
             player,
             lib_err,
+            gl,
+            gl_video: None,
             video_tex: None,
             frame_buf: Vec::new(),
             frame_w: 0,
@@ -274,6 +316,117 @@ impl DouyuApp {
         self.frame_ready = true;
     }
 
+    /// 重建 OpenGL 渲染目标（纹理 + FBO），并注册为 egui 纹理
+    fn recreate_gl_target(
+        &mut self,
+        gl: &glow::Context,
+        w: usize,
+        h: usize,
+        frame: &mut eframe::Frame,
+    ) {
+        unsafe {
+            if let Some(t) = self.gl_video.take() {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
+            let texture = match gl.create_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[video] 创建纹理失败: {e}");
+                    return;
+                }
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                None,
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let fbo = match gl.create_framebuffer() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[video] 创建 FBO 失败: {e}");
+                    gl.delete_texture(texture);
+                    return;
+                }
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                eprintln!("[video] FBO 不完整: 0x{status:x}");
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(texture);
+                return;
+            }
+
+            let tex_id = frame.register_native_glow_texture(texture);
+            self.gl_video = Some(GlVideoTarget {
+                texture,
+                fbo,
+                tex_id,
+                w,
+                h,
+            });
+        }
+    }
+
+    /// OpenGL 渲染一帧到 FBO 纹理（零拷贝，结果直接是 egui 纹理）
+    fn render_video_gl(&mut self, frame: &mut eframe::Frame, w: usize, h: usize) {
+        let player = match &self.player {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let gl = match &self.gl {
+            Some(g) => g.clone(),
+            None => return,
+        };
+
+        let need_recreate = match &self.gl_video {
+            Some(t) => t.w != w || t.h != h,
+            None => true,
+        };
+        if need_recreate {
+            self.recreate_gl_target(&gl, w, h, frame);
+        }
+
+        let fbo = match &self.gl_video {
+            Some(t) => t.fbo,
+            None => return,
+        };
+        if let Err(e) = player.render_gl(fbo.0.get() as i32, w, h) {
+            if !self.render_err_logged {
+                self.render_err_logged = true;
+                eprintln!("[video] GL 渲染失败（只报一次）: {e}");
+            }
+            return;
+        }
+        if !self.render_ok_logged {
+            self.render_ok_logged = true;
+            eprintln!("[video] GL 首帧渲染成功 {}x{}", w, h);
+        }
+        self.frame_w = w;
+        self.frame_h = h;
+        self.frame_ready = true;
+    }
+
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
@@ -287,7 +440,7 @@ impl Drop for DouyuApp {
 }
 
 impl eframe::App for DouyuApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.drain_danmaku();
 
         // 顶部输入区（全屏时隐藏）
@@ -355,28 +508,37 @@ impl eframe::App for DouyuApp {
                 let rw = ((vw * scale) as usize).clamp(320, 1920);
                 let rh = ((vh * scale) as usize).clamp(180, 1080);
 
-                self.render_frame(rw, rh);
-
-                if self.frame_ready {
-                    let img = egui::ColorImage {
-                        size: [rw, rh],
-                        pixels: self
-                            .frame_buf
-                            .chunks_exact(4)
-                            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
-                            .collect(),
-                    };
-                    match self.video_tex.as_mut() {
-                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                        None => {
-                            self.video_tex = Some(
-                                ctx.load_texture("video", img, egui::TextureOptions::LINEAR),
-                            );
+                // 渲染（OpenGL 零拷贝优先，软件渲染回退）
+                if self.gl.is_some() {
+                    self.render_video_gl(frame, rw, rh);
+                } else {
+                    self.render_frame(rw, rh);
+                    if self.frame_ready {
+                        let img = egui::ColorImage {
+                            size: [rw, rh],
+                            pixels: self
+                                .frame_buf
+                                .chunks_exact(4)
+                                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                .collect(),
+                        };
+                        match self.video_tex.as_mut() {
+                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                            None => {
+                                self.video_tex = Some(
+                                    ctx.load_texture("video", img, egui::TextureOptions::LINEAR),
+                                );
+                            }
                         }
                     }
                 }
 
-                let tex_id = self.video_tex.as_ref().map(|t| t.id());
+                // 取纹理 id（GL 模式用 FBO 纹理，SW 模式用上传纹理）
+                let tex_id = if let Some(t) = &self.gl_video {
+                    Some(t.tex_id)
+                } else {
+                    self.video_tex.as_ref().map(|t| t.id())
+                };
                 if let Some(tid) = tex_id {
                     // 居中铺满 fit 区域
                     let rect = egui::Rect::from_center_size(
