@@ -209,10 +209,32 @@ pub fn nickname(cookie: &str) -> String {
 
 /// 生成二维码点阵（true=黑块）
 pub fn qr_matrix(text: &str) -> Result<(usize, Vec<bool>), String> {
-    let code = qrcode::QrCode::new(text.as_bytes())
-        .map_err(|e| format!("二维码生成失败: {e}"))?;
+    // 用 L 级纠错（7% 容错）：模块更少、单块更大，屏幕扫码更容易识别
+    let code = qrcode::QrCode::with_error_correction_level(
+        text.as_bytes(),
+        qrcode::EcLevel::L,
+    )
+    .map_err(|e| format!("二维码生成失败: {e}"))?;
     let w = code.width();
     let colors = code.to_colors();
     let px = colors.iter().map(|c| *c == qrcode::Color::Dark).collect();
     Ok((w, px))
+}
+
+/// 把 RGBA 像素保存成 PNG（手机相册识别的备用方案）
+pub fn save_png(rgba: &[u8], size: usize, filename: &str) -> Result<PathBuf, String> {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(filename)))
+        .unwrap_or_else(|| PathBuf::from(filename));
+    let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败: {e}"))?;
+    let w = std::io::BufWriter::new(file);
+    let mut enc = png::Encoder::new(w, size as u32, size as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| format!("PNG 头写入失败: {e}"))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|e| format!("PNG 数据写入失败: {e}"))?;
+    Ok(path)
 }

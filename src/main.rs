@@ -900,7 +900,8 @@ impl eframe::App for DouyuApp {
     }
 }
 
-/// 把二维码内容渲染成 egui 纹理（每个模块放大 6 像素）
+/// 把二维码内容渲染成 egui 纹理。
+/// 关键：QR 规范要求四周留 4 模块静区（quiet zone），缺失会导致扫码器识别失败。
 fn make_qr_texture(ctx: &egui::Context, url: &str) -> (Option<egui::TextureHandle>, usize) {
     let (w, px) = match login::qr_matrix(url) {
         Ok(v) => v,
@@ -909,20 +910,45 @@ fn make_qr_texture(ctx: &egui::Context, url: &str) -> (Option<egui::TextureHandl
             return (None, 0);
         }
     };
-    let scale = 6usize;
-    let size = w * scale;
+    const QUIET: usize = 4; // 静区模块数
+    const SCALE: usize = 8; // 每模块像素
+    let modules = w + QUIET * 2;
+    let size = modules * SCALE;
     let mut pixels = vec![egui::Color32::WHITE; size * size];
+    let mut dark = 0usize;
     for y in 0..w {
         for x in 0..w {
             if px[y * w + x] {
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        pixels[(y * scale + dy) * size + x * scale + dx] = egui::Color32::BLACK;
+                dark += 1;
+                let ox = (x + QUIET) * SCALE;
+                let oy = (y + QUIET) * SCALE;
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        pixels[(oy + dy) * size + ox + dx] = egui::Color32::BLACK;
                     }
                 }
             }
         }
     }
+    logln!(
+        "[login] 二维码已渲染：{}x{} 模块（含静区 {}），{}px，黑块 {}，内容 {} 字符",
+        modules,
+        modules,
+        QUIET,
+        size,
+        dark,
+        url.chars().count()
+    );
+    // 同时导出 PNG：屏幕扫码失败时可用手机相册识别
+    let rgba: Vec<u8> = pixels
+        .iter()
+        .flat_map(|p| [p.r(), p.g(), p.b(), 255])
+        .collect();
+    match login::save_png(&rgba, size, "douyu_qr.png") {
+        Ok(p) => logln!("[login] 二维码图片已保存: {}", p.display()),
+        Err(e) => logln!("[login] 二维码图片保存失败: {e}"),
+    }
+
     let img = egui::ColorImage {
         size: [size, size],
         pixels,
@@ -1078,6 +1104,36 @@ fn cmd_login_test() {
             let code_short = &s.code[..s.code.len().min(20)];
             let url_short = &s.url[..s.url.len().min(90)];
             logln!("[test] 二维码生成成功 code={code_short} url={url_short}");
+            // 验证：生成二维码 PNG（供解码器校验）
+            if let Ok((w, px)) = login::qr_matrix(&s.url) {
+                const QUIET: usize = 4;
+                const SCALE: usize = 8;
+                let modules = w + QUIET * 2;
+                let size = modules * SCALE;
+                let mut rgba = vec![255u8; size * size * 4];
+                for y in 0..w {
+                    for x in 0..w {
+                        if px[y * w + x] {
+                            let ox = (x + QUIET) * SCALE;
+                            let oy = (y + QUIET) * SCALE;
+                            for dy in 0..SCALE {
+                                for dx in 0..SCALE {
+                                    let i = ((oy + dy) * size + ox + dx) * 4;
+                                    rgba[i] = 0;
+                                    rgba[i + 1] = 0;
+                                    rgba[i + 2] = 0;
+                                    rgba[i + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+                match login::save_png(&rgba, size, "douyu_qr.png") {
+                    Ok(p) => println!("[test] 二维码 PNG: {} ({size}px, {modules} 模块)", p.display()),
+                    Err(e) => println!("[test] PNG 保存失败: {e}"),
+                }
+                println!("[test] 二维码内容: {}", s.url);
+            }
             match login::poll(&s.code) {
                 Ok(st) => logln!("[test] 首次轮询状态: {st:?}"),
                 Err(e) => logln!("[test] 轮询失败: {e}"),
