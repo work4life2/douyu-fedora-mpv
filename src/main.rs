@@ -41,9 +41,11 @@ const INTAKE_PER_FRAME: usize = 16;
 /// 屏幕上同时在飞的弹幕条数硬上限
 const MAX_ITEMS: usize = 200;
 /// 内存看门狗阈值：有画面后 RSS 比基线涨这么多就重建渲染上下文。
-/// 这套 libmpv 渲染外部 FBO 时每帧漏约 5KB（约 1GB/小时），
-/// 取 300MB 意味着正常观看大约 20~30 分钟回收一次，用户无感。
-const MEM_GROWTH_MB: u64 = 300;
+/// 这套 libmpv 渲染外部 FBO 时每帧漏固定一小块 C 侧内存，实测原画 1080p
+/// 能到 1MB/s 量级（比 720p 快好几倍），所以阈值不能太大：
+/// 200MB 意味着最坏情况约 3~4 分钟回收一次，RSS 在 200MB 区间内锯齿，
+/// 而不是一路爬到几个 G。
+const MEM_GROWTH_MB: u64 = 200;
 
 /// 密度档位表：(字号系数, 横穿整屏秒数)。
 /// 弹幕越密 → 字号越小（车道变多）+ 移动越快（车道腾空更快），两者相乘才够吞吐。
@@ -193,6 +195,8 @@ struct DouyuApp {
     rss_base: u64,
     /// 上次重建渲染上下文的时刻
     rc_recycled_at: Instant,
+    /// 当前 RSS（MB），每秒刷新，侧边栏直接显示（省得用户去 htop 猜）
+    rss_mb: u64,
 }
 
 impl DouyuApp {
@@ -323,6 +327,7 @@ impl DouyuApp {
             mem_snap: (0, 0),
             rss_base: 0,
             rc_recycled_at: Instant::now(),
+            rss_mb: 0,
         }
     }
 
@@ -1075,19 +1080,6 @@ impl DouyuApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
-    /// 释放 GL 视频目标（FBO + 纹理）。重建渲染上下文前必须走这里：
-    /// 直接 `gl_video = None` 会把纹理/FBO 丢在显存里没人删。
-    fn drop_gl_target(&mut self) {
-        let Some(t) = self.gl_video.take() else {
-            return;
-        };
-        if let Some(gl) = &self.gl {
-            unsafe {
-                gl.delete_framebuffer(t.fbo);
-                gl.delete_texture(t.texture);
-            }
-        }
-    }
 }
 
 impl Drop for DouyuApp {
@@ -1225,6 +1217,17 @@ impl eframe::App for DouyuApp {
                                 ))
                                 .small()
                                 .weak(),
+                            );
+                        }
+                        if self.rss_mb > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("内存 {}MB", self.rss_mb))
+                                    .small()
+                                    .weak(),
+                            )
+                            .on_hover_text(
+                                "libmpv 渲染外部 FBO 每帧会漏一小块 C 侧内存（不是本项目代码），\n\
+                                 涨过阈值会自动重建渲染上下文回收，所以这里是锯齿状、不会一路上涨。",
                             );
                         }
                     });
@@ -1516,6 +1519,7 @@ impl eframe::App for DouyuApp {
             // 活字节涨 = 我们自己漏；活字节平而 RSS 涨 = mpv/GL 或 glibc 碎片。
             let (live_b, live_n) = alloc_stat::live();
             let rss = alloc_stat::rss_kb();
+            self.rss_mb = rss / 1024;
             let (pb, pr) = self.mem_snap;
             self.mem_snap = (live_b, rss);
             let (db, dr) = if pb == 0 {
@@ -1567,8 +1571,8 @@ impl eframe::App for DouyuApp {
                     match p.recycle_render_ctx() {
                         Ok(()) => {
                             self.rc_recycled_at = Instant::now();
-                            // 重新连渲染目标：旧纹理要显式删掉，下一帧会重建并重新注册
-                            self.drop_gl_target();
+                            // 刻意**不**删视频纹理/FBO：新上下文会继续往同一张纹理上画，
+                            // 这样重建对画面完全无感（删了会黑一帧、还要重新注册 tex_id）。
                             self.pending_size = None;
                             self.size_stable_at = None;
                             // 基线跟着下移：否则重建完立刻又满足「超阈值」

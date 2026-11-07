@@ -97,32 +97,46 @@ render-API→外部 FBO 路径**，不是本项目的 Rust 代码。
 |---|---|---|
 | 不开播（只有 UI，60fps 重绘） | 0 KB/s | `[heap]` 完全不动，Rust 活字节 96.0MB 恒定 |
 | 播放 1280×720@30，渲染到 904×508 | +280 KB/s | 堆 +155 KB/s |
-| 播放 1920×1080@30，渲染到 1703×957 | +300 KB/s | ≈1.1GB/小时，和「一小时 1.4G」吻合 |
+| 播放 1920×1080 原画@30，渲染到 904×508 | **+1.2 MB/s** | 比 720p 快 4 倍（跟码率/源分辨率走） |
 | `pause=yes`（流已连，不解码不渲染） | 0 KB/s | **只有帧真往下走才漏** |
 | `hwdec=no`（纯软解） | +155 KB/s | 与硬解无关 |
 | `ao=null`（不出声） | +172 KB/s | 与音频无关 |
 | 独立 `mpv --vo=gpu` 自己的窗口 | 0 KB/s（50 秒共 +240KB） | mpv 本身不漏 |
 
-结论：**每渲染一帧固定漏约 5 KB C 侧内存**（两种分辨率下都是 5.1KB/帧，与像素数无关），
-桶在 `mpv_render_context` 里。已逐项排除：`report_swap`、`block-for-target-time`、
-`gpu-api=opengl`、`target-trc`/`video-output-levels`、`cache`、缩放算法、音频、网络。
-同一时间段内 Rust 侧分配计数（`[mem]` 的「Rust 活」）**一个字节都没涨**。
+结论：每渲染一帧漏一小块 C 侧内存，**速率跟源码率/分辨率走**，原画 1080p 能到 1MB/s
+量级（几 GB/小时）。桶在 `mpv_render_context` 里。已逐项排除：`report_swap`、
+`block-for-target-time`、`gpu-api=opengl`、`target-trc`/`video-output-levels`、
+`cache`、缩放算法、音频、网络。同一时间段内 Rust 侧分配计数（`[mem]` 的「Rust 活」）
+**一个字节都没涨**。
 
-### 处理：渲染上下文定期重建
+另外两笔「涨上去就不还」的固定占用，也顺手处理了：
 
-有画面后记 RSS 基线，涨过 `MEM_GROWTH_MB`（默认 300MB，约 15~20 分钟）就
+- mpv `cache=auto` 默认要 150MiB 解复用缓存 + 75MiB 回看，直播流用不到，
+  基线因此凭空高 120~150MB。改成 `demuxer-max-bytes=32MiB` / `demuxer-max-back-bytes=8MiB`。
+- Noto Sans CJK 字体整套文件 93.5MB（`[mem]` 的「最大档」就是它），换子集字体可再省 ~90MB。
+
+### 处理：渲染上下文定期重建（有坑）
+
+有画面后记 RSS 基线，涨过 `MEM_GROWTH_MB`（默认 200MB）就
 `mpv_render_context_free` + `create` 重建一次渲染上下文，泄漏对象随之释放。
-**不影响播放进度**——解码/解复用状态在 mpv handle 上，不动。
 
-实测（强制 20 秒重建一次）：RSS 651MB → 539MB 一次性回落，之后稳定在 545MB 不再爬。
+> **坑：只重建上下文会把视频打死。** 渲染上下文一释放，挂在它上面的硬解设备
+> （vulkan/vaapi interop）就没了，解码链跟着断——现象是 `width/height` 变 0、
+> `hwdec-current` 变空、画面定格（日志里 `视频 0x0`）。所以重建后必须
+> `set vid no` → `set vid auto` 把视频轨重新挂一遍，硬解会在 2~4 秒内自动回到
+> `vulkan-copy`。少这一步，看起来就像「修完更糟」。
+
+实测：强制 8 秒重建一次，`视频 1280x720` 全程稳定、渲染 60fps、丢帧 0，
+RSS 在 663~693MB 之间锯齿；正常 200MB 阈值下原画约 3 分钟一次、720p 约 11 分钟一次。
 
 ```bash
-DOUYU_MEM_LIMIT_MB=200 ./douyu   # 更激进地回收
-DOUYU_RC_RECYCLE=20 ./douyu      # 调试：固定周期重建，肉眼可见 RSS 锯齿
+DOUYU_MEM_LIMIT_MB=400 ./douyu   # 放宽阈值（锯齿更大，但重建更少）
+DOUYU_RC_RECYCLE=8 ./douyu       # 调试：固定周期重建，肉眼可见 RSS 锯齿
 ```
 
 > 真正的修法在 mpv 侧（换 `--wid` 嵌入或等上游修 render API），
-> 这里是可控的兜底，代价是每次重建有一下极短的画面停顿。
+> 这里是可控的兜底，代价是每次重建后硬解要重新初始化 2~4 秒。
+> 侧边栏底部直接显示「内存 xxxMB」，不用再去 htop 猜。
 
 ### `[mem]` 诊断行
 

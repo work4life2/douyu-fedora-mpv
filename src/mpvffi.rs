@@ -338,6 +338,13 @@ impl MpvPlayer {
                 self.cb_raw as *mut c_void,
             );
             self.render_ctx.store(ctx, Ordering::Release);
+
+            // 关键：渲染上下文一释放，挂在它上面的硬解设备（vulkan/vaapi interop）就没了，
+            // 解码链会跟着断（实测现象：重建后 `width/height` 变 0、`hwdec-current` 变空，
+            // 画面定格）。把视频轨摘掉再挂回去，强制解码器用新上下文的设备重新初始化。
+            let _ = self.command(&["set", "vid", "no"]);
+            let _ = self.command(&["set", "vid", "auto"]);
+            logln!("[mpv] 渲染上下文已重建，视频轨已重新挂载");
             Ok(())
         }
     }
@@ -419,6 +426,11 @@ impl MpvPlayer {
                 // relay 到 CDN 是公网链路，留一点缓冲抗抖动
                 // （原来的 cache=no 会把任何抖动直接顶到解码器）
                 ("cache", "auto"),
+                // 但 cache=auto 的默认上限是 150MiB 解复用缓存 + 75MiB 回看，
+                // 直播流用不到、而且这部分内存**涨上去就不再还**（实测基线因此
+                // 凭空高 120~150MB，看起来很像泄漏）。32MiB ≈ 30~60 秒，够抗抖动。
+                ("demuxer-max-bytes", "32MiB"),
+                ("demuxer-max-back-bytes", "8MiB"),
                 // 软解减负：直播画面跳过去块滤波肉眼几乎无损，省 10~20% 解码。
                 // 硬解成功时该项不生效，无副作用。
                 ("vd-lavc-skiploopfilter", "all"),
@@ -496,6 +508,11 @@ impl MpvPlayer {
                 // relay 到 CDN 是公网链路，留一点缓冲抗抖动
                 // （原来的 cache=no 会把任何抖动直接顶到解码器）
                 ("cache", "auto"),
+                // 但 cache=auto 的默认上限是 150MiB 解复用缓存 + 75MiB 回看，
+                // 直播流用不到、而且这部分内存**涨上去就不再还**（实测基线因此
+                // 凭空高 120~150MB，看起来很像泄漏）。32MiB ≈ 30~60 秒，够抗抖动。
+                ("demuxer-max-bytes", "32MiB"),
+                ("demuxer-max-back-bytes", "8MiB"),
                 // GL 渲染到 FBO 时强制 sRGB + full range 输出（否则可能偏亮/发灰）
                 ("target-trc", "srgb"),
                 ("video-output-levels", "full"),
