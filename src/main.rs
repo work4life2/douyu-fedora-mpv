@@ -1,17 +1,20 @@
 //! 斗鱼直播客户端 —— 原生 GUI、低开销、视频内嵌单窗口。
 //!
 //! 双击启动 → GUI 输入房间号 → 点确定/回车 → 视频内嵌在窗口中央播放。
-//! 侧边栏画质按钮无缝切换，弹幕可开关。
+//! 侧边栏画质按钮无缝切换，弹幕可开关，播放时默认阻止系统待机。
+//! 退出后记住上次的直播间/画质/弹幕开关，下次直接接着看。
 //!
-//! 视频：libmpv 软件渲染（dlopen libmpv.so.2）→ egui 纹理显示（单窗口内嵌）。
-//! 硬解：hwdec=nvdec-copy。弹幕：mpv osd-overlay(libass) 直接渲染进视频帧。
+//! 视频：libmpv 渲染（dlopen libmpv.so.2，优先 GL 零拷贝）→ egui 纹理显示。
+//! 硬解：hwdec=nvdec-copy。弹幕：egui 画在视频层上（车道排程 + 密度自适应。
 //! 续流：本地 FLV 中转解决 300s 断流。
 
+mod config;
 mod danmaku;
 mod douyu;
 mod log;
 mod login;
 mod mpvffi;
+mod power;
 mod relay;
 mod sign;
 
@@ -24,6 +27,19 @@ use eframe::egui;
 use eframe::glow::{self, HasContext};
 
 const QUALITY_NAMES: &[(i32, &str)] = &[(0, "原画"), (4, "蓝光4M"), (3, "超清"), (2, "高清")];
+
+/// 弹幕队列上限（生产者侧）。热房瞬间涌入上千条时，宁可丢最旧的，
+/// 也不能让内存和单帧工作量无上限增长。
+const QUEUE_CAP: usize = 400;
+/// 每帧最多上新条数：把「一口气上 500 条」摊到多帧，避免某帧直接卡住
+const INTAKE_PER_FRAME: usize = 16;
+/// 屏幕上同时在飞的弹幕条数硬上限
+const MAX_ITEMS: usize = 200;
+
+/// 密度档位表：(字号系数, 横穿整屏秒数)。
+/// 弹幕越密 → 字号越小（车道变多）+ 移动越快（车道腾空更快），两者相乘才够吞吐。
+/// 到最后一档还挤不下就丢（保可读性，不叠成一团）。
+const DENSITY: [(f32, f32); 4] = [(1.0, 8.0), (0.88, 7.2), (0.80, 6.4), (0.72, 5.8)];
 
 type Chat = (String, String);
 
@@ -47,16 +63,43 @@ struct LoginUi {
     qr_tex: Option<egui::TextureHandle>,
     qr_px: usize,
     status: String,
+    /// 出错态：状态文字标红，按钮提示「刷新二维码」
+    failed: bool,
+    /// 成功后停在弹窗里等用户点「完成」（以前是瞬间关闭，用户看不到任何反馈）
+    done: bool,
+}
+
+/// 顶部漂浮提示（登录成功/失败要让人一眼看到，不能只写侧边栏小字）
+struct Notice {
+    text: String,
+    until: Instant,
+    ok: bool,
+}
+
+impl Notice {
+    fn new(text: impl Into<String>, ok: bool) -> Self {
+        Self {
+            text: text.into(),
+            until: Instant::now() + Duration::from_secs(if ok { 6 } else { 10 }),
+            ok,
+        }
+    }
 }
 
 /// 一条待显示的弹幕（位置由绘制时按出生时间计算）
 struct Danmaku {
     text: String,
-    row: usize,
+    /// 车道号（0 在最上）。上车时按「该车道尾部是否已完全进场」判定，
+    /// 保证同车道内不会追尾重叠。
+    lane: usize,
     spawn: Instant,
     /// 缓存的文字排版结果（避免每帧重复 layout，这是 60fps 掉 30fps 的主因）
     galley: Option<std::sync::Arc<egui::Galley>>,
+    /// 排版时用的字号，字号变了要重排（窗口缩放/密度档位切换）
     galley_size: f32,
+    /// 排版后的实际像素宽度（出屏判定用它，比「字符数 × 字号」准得多：
+    /// 中文/emoji 是 1 em，ASCII 只有 0.5 em，估算法会差出一倍）
+    width: f32,
 }
 
 struct DouyuApp {
@@ -97,6 +140,7 @@ struct DouyuApp {
     login: Option<LoginUi>,
     login_rx: Option<mpsc::Receiver<LoginMsg>>,
     login_stop: Option<Arc<AtomicBool>>,
+    notice: Option<Notice>,
     /// 手动粘贴 Cookie 弹窗的内容（None=关闭）
     cookie_input: Option<String>,
     logged_in_as: Option<String>,
@@ -105,8 +149,30 @@ struct DouyuApp {
     danmaku_on: Arc<AtomicBool>,
     danmaku_stop: Arc<AtomicBool>,
     danmaku_queue: Arc<Mutex<VecDeque<Chat>>>,
+    /// 队列撑满被丢掉的条数（生产者线程写，界面侧取走加到丢帧计数里）
+    danmaku_cap_drops: Arc<std::sync::atomic::AtomicU32>,
     danmaku_list: Vec<Danmaku>,
-    next_danmaku_row: u64,
+    /// 每条车道「下一次可以再上车」的时刻。用单调时间而不是逐条扫描列表：
+    /// 弹幕匀速左移，一条宽度 w 的弹幕占住车道 (w+间距)/速度 秒，之后车道必然空出。
+    lane_free_at: Vec<Instant>,
+    /// 密度档位 0/1/2：热房自动缩小字号、加快横穿速度，换取更多车道与吞吐
+    dense: u8,
+    /// 当前 1 秒窗口内因车道占满而丢弃的条数
+    drops_window: u32,
+    /// 连续多少个 1 秒窗口一条没丢（用于把密度档位降回去）
+    idle_windows: u8,
+    drops_total: u64,
+    drops_timer: Instant,
+    /// 上一帧视频区的逻辑尺寸：弹幕字号/车道数按它算，避免入队时还不知道尺寸
+    vw_last: f32,
+    vh_last: f32,
+
+    // 本机配置（记住上次直播间 / 待机策略 / 画质）
+    cfg: config::Config,
+    /// 播放时阻止系统自动待机
+    sleep: power::SleepInhibitor,
+    /// 首帧自动恢复上次的直播间
+    autostart: bool,
 }
 
 impl DouyuApp {
@@ -174,9 +240,23 @@ impl DouyuApp {
             None
         };
 
+        // 本机配置：上次的直播间、待机策略、画质、弹幕开关
+        let cfg = config::Config::load();
+        let last = cfg.last_room.clone().unwrap_or_default();
+        // 播放时阻止系统待机（默认开），起不来只记日志，不影响播放
+        let mut sleep = power::SleepInhibitor::new();
+        if cfg.prevent_sleep {
+            sleep.start();
+        }
+        let status = if last.is_empty() {
+            "请输入房间号，点「确定」或回车加载".to_string()
+        } else {
+            format!("将恢复上次的直播间 {last}（可直接改房间号）")
+        };
+
         DouyuApp {
-            room_input: String::new(),
-            status: "请输入房间号，点「确定」或回车加载".to_string(),
+            room_input: last.clone(),
+            status,
             fullscreen: false,
             stream_state,
             relay_url,
@@ -199,13 +279,25 @@ impl DouyuApp {
             login: None,
             login_rx: None,
             login_stop: None,
+            notice: None,
             cookie_input: None,
             logged_in_as: login::load_cookie().map(|c| login::nickname(&c)),
-            danmaku_on: Arc::new(AtomicBool::new(true)),
+            danmaku_on: Arc::new(AtomicBool::new(cfg.danmaku_on)),
             danmaku_stop: Arc::new(AtomicBool::new(false)),
             danmaku_queue: Arc::new(Mutex::new(VecDeque::new())),
+            danmaku_cap_drops: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             danmaku_list: Vec::new(),
-            next_danmaku_row: 0,
+            lane_free_at: Vec::new(),
+            dense: 0,
+            drops_window: 0,
+            idle_windows: 0,
+            drops_total: 0,
+            drops_timer: Instant::now(),
+            vw_last: 1280.0,
+            vh_last: 720.0,
+            cfg,
+            sleep,
+            autostart: !last.is_empty(),
         }
     }
 
@@ -232,14 +324,26 @@ impl DouyuApp {
         self.danmaku_stop.store(true, Ordering::Relaxed);
         self.danmaku_list.clear();
         self.danmaku_queue.lock().unwrap().clear();
+        // 上一个房间遗留的丢弃计数不带进新房，否则密度会误升档
+        self.danmaku_cap_drops.store(0, Ordering::Relaxed);
+        self.drops_window = 0;
+        self.idle_windows = 0;
+        self.reset_lanes();
 
         // 换流（relay 检测状态变化无缝切流）+ 播放
-        *self.stream_state.lock().unwrap() = (rid.clone(), 0);
+        *self.stream_state.lock().unwrap() = (rid.clone(), self.cfg.quality);
         let url = self.relay_url.clone();
         // 直接调用（mpv_command 本身很快，不要 spawn+join 阻塞 UI 线程）
         if let Err(e) = self.player.as_ref().unwrap().loadfile(&url) {
             self.status = format!("加载失败: {e}");
             return;
+        }
+
+        // 记住这个房间（下次启动直接恢复），落盘失败不影响播放
+        if self.cfg.last_room.as_deref() != Some(rid.as_str()) {
+            self.cfg.last_room = Some(rid.clone());
+            self.cfg.save();
+            logln!("[room] 已记住直播间 {rid}");
         }
 
         // 新弹幕线程
@@ -249,15 +353,52 @@ impl DouyuApp {
         let rid2 = rid.clone();
         std::thread::spawn(move || danmaku::run(rid2, stop, tx));
         let queue = self.danmaku_queue.clone();
+        let cap_drops = self.danmaku_cap_drops.clone();
         let ctx2 = ctx.clone();
+        // 桥接线程：攒够一批再推队列 + 只请求一次重绘。
+        // 旧写法每条弹幕都 request_repaint()，热房一秒几百次唤醒 UI 线程。
         std::thread::spawn(move || {
-            for chat in rx {
-                queue.lock().unwrap().push_back(chat);
+            while let Ok(first) = rx.recv() {
+                let mut n = 1;
+                {
+                    let mut q = queue.lock().unwrap();
+                    if push_capped(&mut q, first) {
+                        cap_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // 一次最多搬 64 条，剩下的留到下一轮，避免长时间持锁
+                    while n < 64 {
+                        match rx.try_recv() {
+                            Ok(c) => {
+                                if push_capped(&mut q, c) {
+                                    cap_drops.fetch_add(1, Ordering::Relaxed);
+                                }
+                                n += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
                 ctx2.request_repaint();
             }
         });
 
         self.status = format!("正在播放房间 {rid}");
+
+        // 调试：合成弹幕洪水，肉眼验证密集场景（真热房在游客态常被限流，测不出密度）
+        if let Ok(v) = std::env::var("DOUYU_STRESS") {
+            if let Ok(rate) = v.trim().parse::<u32>() {
+                if rate > 0 {
+                    logln!("[stress] 合成弹幕 {rate} 条/秒（关掉 DOUYU_STRESS 即停）");
+                    spawn_stress_feeder(
+                        rate,
+                        self.danmaku_stop.clone(),
+                        self.danmaku_queue.clone(),
+                        self.danmaku_cap_drops.clone(),
+                        ctx.clone(),
+                    );
+                }
+            }
+        }
     }
 
     /// 打开扫码登录：起后台线程生成二维码 + 轮询（绝不阻塞 UI 线程）
@@ -274,6 +415,8 @@ impl DouyuApp {
             qr_tex: None,
             qr_px: 0,
             status: "正在获取二维码…".to_string(),
+            failed: false,
+            done: false,
         });
 
         std::thread::spawn(move || {
@@ -292,6 +435,7 @@ impl DouyuApp {
                 return;
             }
             // 2) 轮询循环（2 秒一次，分片 sleep 便于及时停止）
+            let mut err_streak = 0;
             loop {
                 for _ in 0..20 {
                     if stop.load(Ordering::Relaxed) {
@@ -304,9 +448,12 @@ impl DouyuApp {
                 }
                 match login::poll(&sess.code) {
                     Ok(st) => {
+                        err_streak = 0;
+                        // 终态：成功 / 换票失败 / 过期 / 取消 —— 都别再轮询
                         let done = matches!(
                             st,
                             login::PollState::Success(_)
+                                | login::PollState::Failed(_)
                                 | login::PollState::Expired
                                 | login::PollState::Rejected
                         );
@@ -314,6 +461,10 @@ impl DouyuApp {
                             login::PollState::Waiting => "等待扫码",
                             login::PollState::Scanned => "已扫待确认",
                             login::PollState::Success(_) => "成功",
+                            login::PollState::Failed(e) => {
+                                logln!("[login] 换票失败: {e}");
+                                "换票失败"
+                            }
                             login::PollState::Expired => "已过期",
                             login::PollState::Rejected => "已取消",
                         };
@@ -326,8 +477,11 @@ impl DouyuApp {
                         }
                     }
                     Err(e) => {
-                        logln!("[login] 轮询/换票失败: {e}");
-                        if tx.send(LoginMsg::Poll(Err(e))).is_err() {
+                        // 网络抖动重试；连续 3 次失败才报到界面（避免静默死循环）
+                        err_streak += 1;
+                        logln!("[login] 轮询失败({err_streak}/3): {e}");
+                        if err_streak >= 3 {
+                            let _ = tx.send(LoginMsg::Poll(Err(e)));
                             return;
                         }
                     }
@@ -350,7 +504,6 @@ impl DouyuApp {
             }
             None => return,
         };
-        let mut finished = false;
         for m in msgs {
             match m {
                 LoginMsg::Qr(Ok((_code, url))) => {
@@ -359,78 +512,261 @@ impl DouyuApp {
                         l.qr_tex = tex;
                         l.qr_px = px;
                         l.status = "等待扫码…".to_string();
+                        l.failed = false;
+                    }
+                    if self.login.as_ref().map(|l| l.qr_tex.is_none()).unwrap_or(false) {
+                        logln!("[login] 二维码纹理未生成");
+                        self.notice = Some(Notice::new("二维码渲染失败，请点「刷新」", false));
                     }
                 }
                 LoginMsg::Qr(Err(e)) => {
+                    logln!("[login] 二维码获取失败: {e}");
                     if let Some(l) = &mut self.login {
                         l.status = format!("获取二维码失败: {e}");
+                        l.failed = true;
                     }
+                    self.notice = Some(Notice::new(format!("获取二维码失败: {e}"), false));
                 }
                 LoginMsg::Poll(Ok(login::PollState::Success(cookie))) => {
                     let nick = login::nickname(&cookie);
                     self.logged_in_as = Some(nick.clone());
                     self.status = format!("已登录「{nick}」，重新加载房间即可看原画");
-                    finished = true;
+                    self.notice = Some(Notice::new(format!("✓ 扫码登录成功：{nick}"), true));
+                    if let Some(l) = &mut self.login {
+                        l.status = format!("已登录：{nick}");
+                        l.failed = false;
+                        l.done = true;
+                    }
                 }
                 LoginMsg::Poll(Ok(st)) => {
-                    let txt = match st {
-                        login::PollState::Waiting => "等待扫码…",
-                        login::PollState::Scanned => "已扫码，请在手机上点确认",
-                        login::PollState::Expired => "二维码已过期，点「刷新」",
-                        login::PollState::Rejected => "已取消登录",
-                        login::PollState::Success(_) => "",
+                    let (txt, bad) = match st {
+                        login::PollState::Waiting => ("等待扫码…".to_string(), false),
+                        login::PollState::Scanned => ("已扫码，请在手机上点确认".to_string(), false),
+                        login::PollState::Expired => ("二维码已过期，点「刷新」重来".to_string(), true),
+                        login::PollState::Rejected => ("已取消登录，点「刷新」重试".to_string(), true),
+                        login::PollState::Failed(e) => (e, true),
+                        login::PollState::Success(_) => (String::new(), false),
                     };
+                    if bad {
+                        self.status = format!("登录失败: {txt}");
+                        self.notice = Some(Notice::new(
+                            format!("登录未完成：{}", brief(&txt, 90)),
+                            false,
+                        ));
+                    }
                     if let Some(l) = &mut self.login {
-                        l.status = txt.to_string();
-                        if matches!(st, login::PollState::Expired | login::PollState::Rejected) {
-                            // 保留弹窗让用户点刷新
-                        }
+                        l.status = txt;
+                        l.failed = bad;
                     }
                 }
                 LoginMsg::Poll(Err(e)) => {
+                    logln!("[login] 轮询连续失败: {e}");
                     if let Some(l) = &mut self.login {
-                        l.status = format!("轮询出错: {e}");
+                        l.status = format!("网络错误: {e}");
+                        l.failed = true;
                     }
+                    self.notice = Some(Notice::new(
+                        format!("登录轮询失败：{}", brief(&e, 90)),
+                        false,
+                    ));
                 }
             }
         }
-        if finished {
-            self.login = None;
-            self.login_rx = None;
-            if let Some(st) = self.login_stop.take() {
-                st.store(true, Ordering::Relaxed);
+        // 登录弹窗打开期间保持刷新（让后台消息及时处理）；成功后是静态页，不必再刷
+        if let Some(l) = &self.login {
+            if !l.done {
+                ctx.request_repaint_after(Duration::from_millis(200));
             }
-        }
-        // 登录弹窗打开期间保持刷新（让后台消息及时处理）
-        if self.login.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
-    fn drain_danmaku(&mut self) {
-        if !self.danmaku_on.load(Ordering::Relaxed) {
-            self.danmaku_queue.lock().unwrap().clear();
+    /// 顶部居中漂浮提示：登录成功/失败的关键反馈
+    fn draw_notice(&mut self, ctx: &egui::Context) {
+        let Some(n) = &self.notice else {
+            return;
+        };
+        if Instant::now() >= n.until {
+            self.notice = None;
             return;
         }
-        let mut q = self.danmaku_queue.lock().unwrap();
-        while let Some((_nn, txt)) = q.pop_front() {
-            if txt.trim().is_empty() {
-                continue;
-            }
-            // 限制数量，防止弹幕海量堆积（屏幕同步可见的不会超过几十条）
-            if self.danmaku_list.len() > 60 {
-                self.danmaku_list.remove(0);
-            }
-            let row = (self.next_danmaku_row % 13) as usize;
-            self.next_danmaku_row += 1;
-            self.danmaku_list.push(Danmaku {
-                text: txt,
-                row,
-                spawn: Instant::now(),
-                galley: None,
-                galley_size: 0.0,
+        let (text, ok) = (n.text.clone(), n.ok);
+        let (bg, fg) = if ok {
+            (
+                egui::Color32::from_rgb(0x1e, 0x6f, 0x43),
+                egui::Color32::from_rgb(0xea, 0xfb, 0xef),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(0x8c, 0x24, 0x24),
+                egui::Color32::from_rgb(0xfd, 0xec, 0xec),
+            )
+        };
+        egui::Area::new(egui::Id::new("douyu_notice"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 14.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(bg)
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(text).color(fg).size(16.0).strong());
+                    });
             });
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
+    /// 当前密度档位参数 (字号系数, 横穿秒数)
+    fn density(&self) -> (f32, f32) {
+        DENSITY[(self.dense as usize).min(DENSITY.len() - 1)]
+    }
+
+    /// 当前字号：随视频高度缩放；密集时自动缩小（换更多车道 + 更快腾空车道）
+    fn danmaku_font_size(&self) -> f32 {
+        let base = (self.vh_last / 26.0).clamp(14.0, 34.0);
+        (base * self.density().0).max(12.0)
+    }
+
+    /// 横穿整屏用几秒（密集时略快，提升每秒可容纳的条数）
+    fn danmaku_secs(&self) -> f32 {
+        self.density().1
+    }
+
+    /// (车道数, 车道高)
+    fn lane_metrics(&self) -> (usize, f32) {
+        let fs = self.danmaku_font_size();
+        let lane_h = (fs * 1.55).max(1.0);
+        let lanes = ((self.vh_last / lane_h).floor() as usize).clamp(1, 24);
+        (lanes, lane_h)
+    }
+
+    fn reset_lanes(&mut self) {
+        self.lane_free_at.clear();
+    }
+
+    /// 车道数量变化（窗口缩放 / 密度档位切换）时同步「各车道空闲时刻」表
+    fn sync_lanes(&mut self, lanes: usize) {
+        if self.lane_free_at.len() == lanes {
+            return;
         }
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap_or_else(Instant::now);
+        self.lane_free_at.resize(lanes, past);
+        // 缩小窗口后越界的弹幕直接丢掉（跟 retain 里 `d.lane < lanes` 对应）
+        let n = self.lane_free_at.len();
+        self.danmaku_list.retain(|d| d.lane < n);
+    }
+
+    /// 从队列取弹幕上车。每帧有上限，车道上限由「空闲时刻」表判定。
+    fn drain_danmaku(&mut self, ctx: &egui::Context) {
+        if !self.danmaku_on.load(Ordering::Relaxed) {
+            self.danmaku_queue.lock().unwrap().clear();
+            if !self.danmaku_list.is_empty() {
+                self.danmaku_list.clear();
+                self.reset_lanes();
+            }
+            return;
+        }
+        let now = Instant::now();
+        // 队列撑满丢掉的也算「丢弃」：否则队列溢出时密度自适应完全失灵
+        // （那些条根本没走到车道判定这一步）
+        let capped = self.danmaku_cap_drops.swap(0, Ordering::Relaxed);
+        self.drops_window += capped;
+        self.drops_total += capped as u64;
+        // 一次持锁取一小批：热房一帧来上千条也只处理前 16 条，剩下的下一帧继续
+        let mut batch: Vec<Chat> = Vec::with_capacity(INTAKE_PER_FRAME);
+        {
+            let mut q = self.danmaku_queue.lock().unwrap();
+            for _ in 0..INTAKE_PER_FRAME {
+                match q.pop_front() {
+                    Some(c) => batch.push(c),
+                    None => break,
+                }
+            }
+        }
+        for (_nn, txt) in batch {
+            self.push_danmaku(ctx, &txt, now);
+        }
+        self.tune_density(now);
+    }
+
+    /// 单条弹幕上车：挑一条当前空闲的车道；全满就丢弃（记数，用于自动升档）
+    fn push_danmaku(&mut self, ctx: &egui::Context, raw: &str, now: Instant) {
+        let text = sanitize_danmaku(raw);
+        if text.is_empty() {
+            return;
+        }
+        let (lanes, _) = self.lane_metrics();
+        self.sync_lanes(lanes);
+
+        // 从上往下找第一条空闲车道：既不重叠，视觉上也先填满上部
+        let lane = self.lane_free_at.iter().position(|t| *t <= now);
+        let Some(lane) = lane else {
+            self.drops_window += 1;
+            self.drops_total += 1;
+            return;
+        };
+
+        // 排版：每条只做一次，顺手拿到真实宽度（出屏判定与车道占用时长都用它）
+        let fs = self.danmaku_font_size();
+        let galley = ctx.fonts(|f| {
+            f.layout_no_wrap(text.clone(), egui::FontId::proportional(fs), egui::Color32::WHITE)
+        });
+        let w = galley.size().x.max(1.0);
+        let speed = (self.vw_last.max(320.0) / self.danmaku_secs()).max(1.0);
+        let gap = (fs * 1.2).max(12.0);
+        // 这条弹幕的尾部完全进场（留出 gap）之前，同车道不能再发车，
+        // 否则后车会在屏幕上追尾。两车同速，一旦尾部进场就永不重叠。
+        self.lane_free_at[lane] = now + Duration::from_secs_f32(lane_hold_secs(w, gap, speed));
+
+        self.danmaku_list.push(Danmaku {
+            text,
+            lane,
+            spawn: now,
+            galley: Some(galley),
+            galley_size: fs,
+            width: w,
+        });
+        if self.danmaku_list.len() > MAX_ITEMS {
+            self.danmaku_list.remove(0);
+        }
+    }
+
+    /// 按丢帧情况自适应密度档位：热房自动缩字提速，人少了再涨回来
+    fn tune_density(&mut self, now: Instant) {
+        if now.duration_since(self.drops_timer) < Duration::from_secs(1) {
+            return;
+        }
+        self.drops_timer = now;
+        if self.drops_window >= 8 && self.dense < DENSITY.len() as u8 - 1 {
+            self.dense += 1;
+            self.idle_windows = 0;
+            logln!(
+                "[danmaku] 弹幕过密（1 秒丢 {} 条），密度档位→{}（字号缩至 {:.0}px，横穿 {:.1}s）",
+                self.drops_window,
+                self.dense,
+                self.danmaku_font_size(),
+                self.danmaku_secs()
+            );
+        } else if self.drops_window == 0 {
+            self.idle_windows = self.idle_windows.saturating_add(1);
+            // 连续 8 秒零丢弃才降档，避免在临界点来回抖
+            if self.idle_windows >= 8 && self.dense > 0 {
+                self.dense -= 1;
+                self.idle_windows = 0;
+                logln!(
+                    "[danmaku] 弹幕转疏，密度档位→{}（字号 {:.0}px，横穿 {:.1}s）",
+                    self.dense,
+                    self.danmaku_font_size(),
+                    self.danmaku_secs()
+                );
+            }
+        } else {
+            self.idle_windows = 0;
+        }
+        self.drops_window = 0;
     }
 
     /// 绘制弹幕并移除已出屏的。origin 为视频区域左上角（painter_at 不平移坐标，需手动加）。
@@ -442,46 +778,51 @@ impl DouyuApp {
         vh: f32,
         now: Instant,
     ) {
+        // 先把视频区尺寸记下来：正文用不到时也要更新，否则窗口缩放后
+        // 第一条弹幕会按旧尺寸算车道
+        self.vw_last = vw;
+        self.vh_last = vh;
         if self.danmaku_list.is_empty() {
             return;
         }
-        let font_size = (vh / 26.0).clamp(14.0, 34.0);
+        let font_size = self.danmaku_font_size();
+        let (lanes, lane_h) = self.lane_metrics();
         let font = egui::FontId::proportional(font_size);
-        let row_h = vh / 13.0;
-        // 8 秒横穿整屏
-        let speed = vw / 8.0;
+        let speed = (vw / self.danmaku_secs()).max(1.0);
+        // 兜底寿命：即使出屏判定因字号突变失准，也不会永久堆积
+        let max_life = self.danmaku_secs() * 1.6;
 
-        let mut i = 0;
-        while i < self.danmaku_list.len() {
-            let (text, row, spawn) = {
-                let d = &self.danmaku_list[i];
-                (d.text.clone(), d.row, d.spawn)
-            };
-            let elapsed = now.duration_since(spawn).as_secs_f32();
-            // 文本左上角 x：从右边缘进入，向左移动
-            let x = vw - elapsed * speed;
-            // 估算文本宽度（用于判断出屏）
-            let text_w = text.chars().count() as f32 * font_size * 0.92;
-            if x + text_w < 0.0 {
-                self.danmaku_list.remove(i);
-                continue;
+        // 一次性 retain 清屏（旧代码在循环里 remove(i) 是 O(n)，密集时自己拖垮自己）
+        self.danmaku_list.retain(|d| {
+            if d.lane >= lanes {
+                return false;
             }
-            // 排版结果缓存：每条弹幕只 layout 一次（字号变化才重建）
-            let galley = {
-                let d = &mut self.danmaku_list[i];
-                if d.galley.is_none() || (d.galley_size - font_size).abs() > 0.5 {
-                    d.galley =
-                        Some(painter.layout_no_wrap(d.text.clone(), font.clone(), egui::Color32::WHITE));
-                    d.galley_size = font_size;
-                }
-                d.galley.clone().unwrap()
-            };
-            // 关键：加上视频区左上角偏移（painter_at 只裁剪不平移）
-            let pos = origin + egui::vec2(x, row as f32 * row_h + 4.0);
+            let elapsed = now.duration_since(d.spawn).as_secs_f32();
+            if elapsed > max_life {
+                return false;
+            }
+            let x = vw - elapsed * speed;
+            x + d.width >= 0.0
+        });
+
+        for d in &mut self.danmaku_list {
+            if d.galley.is_none() || (d.galley_size - font_size).abs() > 0.5 {
+                let g = painter.layout_no_wrap(
+                    d.text.clone(),
+                    font.clone(),
+                    egui::Color32::WHITE,
+                );
+                d.width = g.size().x.max(1.0);
+                d.galley = Some(g);
+                d.galley_size = font_size;
+            }
+            let elapsed = now.duration_since(d.spawn).as_secs_f32();
+            let x = vw - elapsed * speed;
+            let pos = origin + egui::vec2(x, d.lane as f32 * lane_h + 4.0);
+            let galley = d.galley.clone().unwrap();
             // 描边 2 次（对角偏移）而非 4 次，减半绘制开销
             painter.galley(pos + egui::vec2(1.0, 1.0), galley.clone(), egui::Color32::BLACK);
             painter.galley(pos, galley, egui::Color32::WHITE);
-            i += 1;
         }
     }
 
@@ -652,7 +993,22 @@ impl Drop for DouyuApp {
 
 impl eframe::App for DouyuApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.drain_danmaku();
+        // 首帧恢复上次的直播间（等中转/播放器都就绪后再加载）
+        if self.autostart {
+            self.autostart = false;
+            let rid = self.room_input.trim().to_string();
+            if !rid.is_empty() {
+                logln!("[room] 自动恢复上次直播间 {rid}");
+                self.load_room(ctx);
+            }
+        }
+
+        self.drain_danmaku(ctx);
+
+        // 待机抑制自愈：开关开着但进程被系统杀了（挂起唤醒后很常见）→ 重新拉起
+        if self.cfg.prevent_sleep {
+            self.sleep.ensure(true);
+        }
 
         // 顶部输入区（全屏时隐藏）
         if !self.fullscreen {
@@ -691,12 +1047,55 @@ impl eframe::App for DouyuApp {
                             logln!("[quality] 点击切换: {name} (rate={val})，当前 rate={q}");
                             self.stream_state.lock().unwrap().1 = *val;
                             self.status = format!("已切换到 {name}（无缝）");
+                            // 记住画质，下次开播沿用
+                            if self.cfg.quality != *val {
+                                self.cfg.quality = *val;
+                                self.cfg.save();
+                            }
                         }
                     }
                     ui.separator();
                     let mut on = self.danmaku_on.load(Ordering::Relaxed);
                     if ui.checkbox(&mut on, "显示弹幕").changed() {
                         self.danmaku_on.store(on, Ordering::Relaxed);
+                        self.cfg.danmaku_on = on;
+                        self.cfg.save();
+                        if !on {
+                            self.danmaku_list.clear();
+                            self.reset_lanes();
+                        }
+                    }
+                    ui.separator();
+                    // 阻止系统自动待机（息屏/休眠）：默认开，可在侧边栏随时关掉
+                    let mut keep_awake = self.cfg.prevent_sleep;
+                    if ui.checkbox(&mut keep_awake, "禁止自动待机").changed() {
+                        self.cfg.prevent_sleep = keep_awake;
+                        if keep_awake {
+                            let ok = self.sleep.start();
+                            self.status = if ok {
+                                "已阻止系统待机（关闭窗口即恢复）".to_string()
+                            } else {
+                                self.sleep
+                                    .last_err()
+                                    .unwrap_or("无法阻止系统待机")
+                                    .to_string()
+                            };
+                        } else {
+                            self.sleep.stop();
+                            self.status = "已允许系统自动待机".to_string();
+                        }
+                        self.cfg.save();
+                    }
+                    // 抑制失败时在侧边栏直接说明原因（比如没有 systemd-inhibit）
+                    let inh_err = self.sleep.last_err().map(|s| s.to_string());
+                    if let Some(e) = inh_err {
+                        if self.cfg.prevent_sleep && !self.sleep.alive() {
+                            ui.label(
+                                egui::RichText::new(brief(&e, 40))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0xd0, 0x3a, 0x3a)),
+                            );
+                        }
                     }
                     ui.separator();
                     if ui.button("全屏 (f)").clicked() {
@@ -847,13 +1246,15 @@ impl eframe::App for DouyuApp {
             if let Some(raw) = self.cookie_input.clone() {
                 match login::normalize_cookie(&raw) {
                     Ok(c) => {
-                        login::save_cookie(&c);
+                        let _ = login::save_cookie(&c);
                         self.logged_in_as = login::load_cookie().map(|c| login::nickname(&c));
                         self.status = "Cookie 已保存，重新加载房间即可看原画".to_string();
+                        self.notice = Some(Notice::new("Cookie 已保存", true));
                         self.cookie_input = None;
                     }
                     Err(e) => {
                         self.status = format!("Cookie 无效: {e}");
+                        self.notice = Some(Notice::new(format!("Cookie 无效: {e}"), false));
                     }
                 }
             }
@@ -873,23 +1274,59 @@ impl eframe::App for DouyuApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label("请用斗鱼 App 扫码登录");
-                        ui.add_space(4.0);
-                        if let Some(tex) = &lg.qr_tex {
-                            ui.image((tex.id(), egui::vec2(lg.qr_px as f32, lg.qr_px as f32)));
-                        } else {
-                            ui.label("二维码生成失败");
-                        }
-                        ui.add_space(4.0);
-                        ui.label(&lg.status);
-                        ui.horizontal(|ui| {
-                            if ui.button("刷新").clicked() {
-                                refresh_login = true;
-                            }
-                            if ui.button("关闭").clicked() {
+                        if lg.done {
+                            // 成功态：明确停住，等用户点「完成」（不再瞬间消失）
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("✓ 登录成功")
+                                    .size(22.0)
+                                    .color(egui::Color32::from_rgb(0x2e, 0x9e, 0x5b))
+                                    .strong(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(&lg.status).size(15.0));
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("原画已解锁，重新点「确定」加载房间即可生效")
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("完成").clicked() {
                                 close_login = true;
                             }
-                        });
+                        } else {
+                            ui.label("请用斗鱼 App 扫码登录");
+                            ui.add_space(4.0);
+                            if let Some(tex) = &lg.qr_tex {
+                                ui.image((tex.id(), egui::vec2(lg.qr_px as f32, lg.qr_px as f32)));
+                            } else {
+                                ui.label("二维码生成失败");
+                            }
+                            ui.add_space(4.0);
+                            if lg.failed {
+                                ui.label(
+                                    egui::RichText::new(&lg.status)
+                                        .color(egui::Color32::from_rgb(0xd0, 0x3a, 0x3a)),
+                                );
+                                ui.label(
+                                    egui::RichText::new("点「刷新二维码」重新开始")
+                                        .small()
+                                        .weak(),
+                                );
+                            } else {
+                                ui.label(&lg.status);
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("刷新二维码").clicked() {
+                                    refresh_login = true;
+                                }
+                                if ui.button("关闭").clicked() {
+                                    close_login = true;
+                                }
+                            });
+                        }
                     });
                 });
         }
@@ -903,6 +1340,9 @@ impl eframe::App for DouyuApp {
             self.login = None;
             self.login_rx = None;
         }
+
+        // 顶部提示横幅（成功/失败都要一眼能看见；以前只写侧边栏小字，等于没反馈）
+        self.draw_notice(ctx);
 
         // 帧率统计（每秒一次），同时读取 mpv 源帧率和视频参数
         self.frame_count += 1;
@@ -922,8 +1362,18 @@ impl eframe::App for DouyuApp {
                 mistimed = p.get_f64("mistimed-frame-count").unwrap_or(0.0);
                 self.source_fps = if est > 0.5 { est as f32 } else { cont as f32 };
             }
+            // 弹幕运行态（一次性取齐，避免在 logln 参数里混合可变/不可变借用）
+            let now_l = Instant::now();
+            let on_screen = self.danmaku_list.len();
+            let lanes_total = self.lane_free_at.len();
+            let lanes_free = self.lane_free_at.iter().filter(|t| **t <= now_l).count();
+            let awake = match self.sleep.alive() {
+                true => "开",
+                false => "失效",
+            };
+            let awake = if self.cfg.prevent_sleep { awake } else { "关" };
             logln!(
-                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 丢帧 输出{:.0}/解码{:.0}/错时{:.0} | 尺寸 {}x{} | rate={} | 弹幕 {}",
+                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 丢帧 输出{:.0}/解码{:.0}/错时{:.0} | 尺寸 {}x{} | rate={} | 弹幕 在屏{} 车道 {}/{} 空闲 密度{} 累计丢弃{} | 待机抑制 {awake}",
                 self.last_fps,
                 if self.source_fps > 0.5 {
                     format!("{:.1}", self.source_fps)
@@ -940,7 +1390,11 @@ impl eframe::App for DouyuApp {
                 self.frame_w,
                 self.frame_h,
                 self.stream_state.lock().unwrap().1,
-                self.danmaku_list.len()
+                on_screen,
+                lanes_free,
+                lanes_total,
+                self.dense,
+                self.drops_total
             );
             self.frame_count = 0;
             self.fps_timer = Instant::now();
@@ -951,6 +1405,115 @@ impl eframe::App for DouyuApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
+}
+
+/// 调试：合成弹幕洪水（`DOUYU_STRESS=每秒条数`）。
+///
+/// 用途：真实热门直播间对未登录游客会限流（实测 300 万人气的房间只有 1 条/秒），
+/// 想验证「密集弹幕会不会堆死、会不会重叠」需要自己造压力。
+/// 走的是和真实弹幕完全相同的路径（同一个队列、同一个上限、同一个丢弃计数）。
+fn spawn_stress_feeder(
+    rate: u32,
+    stop: Arc<AtomicBool>,
+    queue: Arc<Mutex<VecDeque<Chat>>>,
+    cap_drops: Arc<std::sync::atomic::AtomicU32>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        const WORDS: [&str; 14] = [
+            "666",
+            "主播牛啊",
+            "这波操作可以",
+            "哈哈哈哈哈哈",
+            "开饭了开饭了",
+            "来啦来吧",
+            "牛批牛批牛批",
+            "这游戏真好玩",
+            "前方高能预警",
+            "🎉🎉🎉",
+            "一给我里giaogiao",
+            "这直播间真热闹",
+            "一万个人在说话",
+            "弹幕测试弹幕测试弹幕测试",
+        ];
+        let interval = Duration::from_millis(1000 / rate.max(1) as u64 / 2);
+        let mut i: usize = 0;
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let mut q = queue.lock().unwrap();
+                // 一次两条：模拟高峰时一帧内到达多条
+                for _ in 0..2 {
+                    let w = WORDS[i % WORDS.len()];
+                    if push_capped(&mut q, (format!("观众{}", i % 997), format!("{w} #{i}"))) {
+                        cap_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    i = i.wrapping_add(1);
+                }
+            }
+            ctx.request_repaint();
+            std::thread::sleep(interval);
+        }
+        logln!("[stress] 合成弹幕已停止（共注入 {i} 条）");
+    });
+}
+
+/// 截断长文本用于横幅提示（完整内容留在弹窗/日志里）
+fn brief(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// 弹幕文本清洗。三件事都是「密集时才会爆」的坑：
+/// 1. 控制字符（尤其 `\n`）必须换掉：`layout_no_wrap` 遇到换行会排成多行，
+///    一条弹幕就压到下面几条车道上，画面立刻糊。
+/// 2. 合并连续空白，避免「刷屏空格」把一条弹幕撑满整条车道。
+/// 3. 超长截断：一条 200 字的弹幕会独占一条车道十几秒，热房里等于永久堵死。
+fn sanitize_danmaku(s: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let mut out = String::with_capacity(s.len().min(MAX_CHARS * 4));
+    let mut n = 0usize;
+    let mut last_space = false;
+    for c in s.chars() {
+        let c = if c.is_control() || c == '\u{200b}' { ' ' } else { c };
+        if c == ' ' {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        if n >= MAX_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+        n += 1;
+    }
+    out.trim().to_string()
+}
+
+/// 一条弹幕会占用它的车道多久（秒）。
+///
+/// 弹幕匀速左移，宽度 w 的弹幕从右边缘进场，到尾部完全进场并留出 gap 所需的
+/// 时间是 (w + gap) / speed。这段时间内同车道不能再发车 —— 否则后车会追尾。
+/// 两车速度相同，只要发车瞬间不重叠，之后任何时刻都不会重叠。
+fn lane_hold_secs(width: f32, gap: f32, speed: f32) -> f32 {
+    (width.max(1.0) + gap.max(0.0)) / speed.max(1.0)
+}
+
+/// 弹幕队列入队（带上限）。满了丢最旧的：观众看的是"现在"，旧的迟到弹幕没价值，
+/// 而无上限的队列在热房会一路涨到吃光内存。返回是否发生了丢弃。
+fn push_capped(q: &mut VecDeque<Chat>, chat: Chat) -> bool {
+    let dropped = q.len() >= QUEUE_CAP;
+    if dropped {
+        q.pop_front();
+    }
+    q.push_back(chat);
+    dropped
 }
 
 /// 把二维码内容渲染成 egui 纹理。
@@ -1060,6 +1623,14 @@ fn main() {
             "danmaku-test" => return cmd_danmaku_test(&args[2..]),
             "relay-test" => return cmd_relay_test(&args[2..]),
             "login-test" => return cmd_login_test(),
+            "login-exchange" => return cmd_login_exchange(&args[2..]),
+            // 不是独立命令：设好环境变量后继续走正常 GUI 启动，
+            // 用来肉眼验证密集弹幕（默认 60 条/秒）
+            "danmaku-stress" => {
+                let rate = args.get(2).cloned().unwrap_or_else(|| "60".to_string());
+                std::env::set_var("DOUYU_STRESS", &rate);
+                logln!("[stress] 进入 GUI 后向弹幕注入 {rate} 条/秒合成弹幕");
+            }
             _ => {}
         }
     }
@@ -1153,6 +1724,28 @@ fn cmd_relay_test(rest: &[String]) {
     }
 }
 
+/// 调试：只跑「扫码确认后换登录态」这一段（回调重定向 + Set-Cookie 收集）。
+/// 用来确定 HTTPS/TLS 通路是否正常——这是之前整条链路哑掉的地方。
+fn cmd_login_exchange(rest: &[String]) {
+    let url = match rest.first() {
+        Some(u) => u.clone(),
+        None => {
+            println!("用法: douyu login-exchange '<回调 URL>'");
+            println!("  无 code 时可用普通页面探路，例如 https://www.douyu.com/");
+            return;
+        }
+    };
+    println!("[test] 目标: {}", url.split('?').next().unwrap_or(&url));
+    match login::exchange_cookie(&url) {
+        Ok(c) => println!(
+            "[test] 换票成功，{} 个字段: {}",
+            c.split(';').count(),
+            c
+        ),
+        Err(e) => println!("[test] 换票失败: {e}"),
+    }
+}
+
 /// 调试：验证二维码登录 API 是否可用
 fn cmd_login_test() {
     match login::generate() {
@@ -1196,5 +1789,113 @@ fn cmd_login_test() {
             }
         }
         Err(e) => logln!("[test] 二维码生成失败: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newline_would_break_lanes() {
+        // 换行必须被压成空格：layout_no_wrap 会把 \n 排成多行，一条弹幕压好几条车道
+        assert_eq!(sanitize_danmaku("上\n下"), "上 下");
+        assert_eq!(sanitize_danmaku("a\r\nb"), "a b");
+        assert_eq!(sanitize_danmaku("tab\there"), "tab here");
+    }
+
+    #[test]
+    fn collapse_repeated_spaces() {
+        assert_eq!(sanitize_danmaku("刷   屏    空格"), "刷 屏 空格");
+        assert_eq!(sanitize_danmaku("   前后留白   "), "前后留白");
+        assert_eq!(sanitize_danmaku(""), "");
+        assert_eq!(sanitize_danmaku("   "), "");
+    }
+
+    #[test]
+    fn long_text_is_truncated() {
+        let long = "字".repeat(200);
+        let s = sanitize_danmaku(&long);
+        // 60 字 + 省略号，不会独占车道十几秒
+        assert_eq!(s.chars().count(), 61);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn keeps_normal_text() {
+        assert_eq!(sanitize_danmaku("主播牛啊 666 🎉"), "主播牛啊 666 🎉");
+        assert_eq!(sanitize_danmaku("@S 是转义符"), "@S 是转义符");
+    }
+
+    #[test]
+    fn queue_is_capped() {
+        let mut q: VecDeque<Chat> = VecDeque::new();
+        let mut dropped = 0;
+        for i in 0..(QUEUE_CAP + 50) {
+            if push_capped(&mut q, (String::new(), i.to_string())) {
+                dropped += 1;
+            }
+        }
+        assert_eq!(q.len(), QUEUE_CAP);
+        // 丢弃数要如实反映，密度自适应靠它判断热不热
+        assert_eq!(dropped, 50);
+        // 丢的是最旧的，队尾一定是最新那条
+        assert_eq!(q.back().unwrap().1, (QUEUE_CAP + 49).to_string());
+    }
+
+    /// 车道排程的核心性质：同车道相邻两条，全程不会重叠。
+    /// 按 push_danmaku 的真实逻辑跑：车道空闲时刻 = 发车时刻 + lane_hold_secs(本条宽度)。
+    #[test]
+    fn lane_never_overlaps_even_when_dense() {
+        let vw = 1280.0f32;
+        let speed = vw / 8.0;
+        let gap = 19.0f32; // 16px 字号 × 1.2
+        let widths = [60.0f32, 180.0, 320.0, 90.0];
+        // free_at 初值取一个足够久远的过去：车道开局就是空的
+        let mut free_at = -1.0e6f32;
+        let mut prev: Option<(f32, f32)> = None; // (发车时刻, 宽度)
+        for &w in widths.iter().cycle().take(60) {
+            let spawn = free_at; // 车道一空就发车（最密集的极端情况）
+            if let Some((t0, w0)) = prev {
+                // 发车瞬间：前一条的右边缘必须已经离开右边界一个 gap
+                let right_of_prev = vw - (spawn - t0) * speed + w0;
+                assert!(
+                    right_of_prev <= vw - gap + 0.01,
+                    "spawn={spawn:.2} 追尾：前一条右边缘 {right_of_prev:.1} > 上限 {:.1}",
+                    vw - gap
+                );
+                // 之后任意时刻间距恒定（两车同速），抽查几个时刻
+                for dt in [0.0f32, 0.5, 2.0, 5.0, 7.9] {
+                    let l_new = vw - dt * speed;
+                    let r_prev = vw - ((spawn + dt) - t0) * speed + w0;
+                    assert!(l_new >= r_prev - 0.01, "spawn+{dt}s 处发生重叠");
+                }
+            }
+            prev = Some((spawn, w));
+            free_at = spawn + lane_hold_secs(w, gap, speed);
+        }
+    }
+
+    /// 吞吐自检：1280x720 视频区，按真实字号/车道公式算每秒能上多少条。
+    #[test]
+    fn lane_throughput_grows_with_density() {
+        let (vw, vh) = (1280.0f32, 720.0f32);
+        let mut last = 0.0f32;
+        for (level, (font_factor, secs)) in DENSITY.iter().enumerate() {
+            let fs = (vh / 26.0).clamp(14.0, 34.0) * font_factor;
+            let lane_h = fs * 1.55;
+            let lanes = ((vh / lane_h).floor() as usize).clamp(1, 24) as f32;
+            let speed = vw / secs;
+            let gap = (fs * 1.2).max(12.0);
+            // 按约 8 个汉字（≈8em）的平均宽度估算
+            let per_sec = lanes / lane_hold_secs(fs * 8.0, gap, speed);
+            assert!(
+                per_sec >= last,
+                "档位 {level} 吞吐 {per_sec:.1} 反而低于上一档 {last:.1}"
+            );
+            last = per_sec;
+        }
+        // 最高档要能扛住热房（约 20 条/秒以上才不至于大面积丢）
+        assert!(last > 20.0, "最高密度档吞吐仅 {last:.1} 条/秒");
     }
 }
