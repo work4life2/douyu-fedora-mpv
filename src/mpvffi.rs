@@ -4,13 +4,14 @@
 //! - SW 模式：视频渲染进 RGB 缓冲，egui 上传纹理（CPU 重）。
 //! - OpenGL 模式：视频渲染到 FBO 纹理，egui 直接复用该 GL 纹理（零拷贝）。
 //!
-//! 硬解：OpenGL 模式用 hwdec=nvdec-copy（GPU 解码拷回，mpv GL 渲染），
-//!       渲染结果零拷贝给 egui。
+//! 硬解：hwdec=auto-copy-safe（vaapi/nvdec/vdpau 依次探测，失败回退软解），
+//!       实际生效值在 [fps] 日志的「硬解」字段里。
 
 use eframe::glow;
 use libloading::Library;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use crate::logln;
 
@@ -24,6 +25,9 @@ const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
 const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
+/// 关掉「渲染到目标时间」的阻塞：GUI 自己有 16ms 重绘节奏，让 mpv 在里面再阻塞
+/// 一次显示时钟只会互相打架（而且阻塞式渲染会把 UI 线程拖住）
+const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 
 #[repr(C)]
 struct MpvRenderParam {
@@ -121,8 +125,10 @@ struct MpvLib {
     set_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
     command: unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int,
+    get_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
     terminate_destroy: unsafe extern "C" fn(*mut MpvHandle),
+    mpv_free: unsafe extern "C" fn(*mut c_void),
     render_context_create: unsafe extern "C" fn(
         *mut *mut MpvRenderContext,
         *mut MpvHandle,
@@ -131,6 +137,9 @@ struct MpvLib {
     render_context_set_update_callback:
         unsafe extern "C" fn(*mut MpvRenderContext, Option<UpdateFn>, *mut c_void),
     render_context_render: unsafe extern "C" fn(*mut MpvRenderContext, *mut MpvRenderParam) -> c_int,
+    /// 告诉 mpv「这一帧已经上屏了」。嵌入式渲染里这步不能省：
+    /// 不报告就没有呈现时刻，mpv 的帧计时/引用会一路攒着（实测每帧 ~5KB，一小时 1GB）。
+    render_context_report_swap: unsafe extern "C" fn(*mut MpvRenderContext),
     render_context_free: unsafe extern "C" fn(*mut MpvRenderContext),
 }
 
@@ -170,6 +179,11 @@ impl MpvLib {
             "mpv_get_property",
             unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int
         );
+        let get_property_string = get!(
+            "mpv_get_property_string",
+            unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char
+        );
+        let mpv_free = get!("mpv_free", unsafe extern "C" fn(*mut c_void));
         let error_string =
             get!("mpv_error_string", unsafe extern "C" fn(c_int) -> *const c_char);
         let terminate_destroy =
@@ -190,6 +204,10 @@ impl MpvLib {
             "mpv_render_context_render",
             unsafe extern "C" fn(*mut MpvRenderContext, *mut MpvRenderParam) -> c_int
         );
+        let render_context_report_swap = get!(
+            "mpv_render_context_report_swap",
+            unsafe extern "C" fn(*mut MpvRenderContext)
+        );
         let render_context_free =
             get!("mpv_render_context_free", unsafe extern "C" fn(*mut MpvRenderContext));
 
@@ -201,11 +219,14 @@ impl MpvLib {
             set_property_string,
             command,
             get_property,
+            get_property_string,
             error_string,
             terminate_destroy,
+            mpv_free,
             render_context_create,
             render_context_set_update_callback,
             render_context_render,
+            render_context_report_swap,
             render_context_free,
         })
     }
@@ -231,9 +252,95 @@ unsafe extern "C" fn gl_get_proc(ctx: *mut c_void, name: *const c_char) -> *mut 
 pub struct MpvPlayer {
     lib: Arc<MpvLib>,
     handle: *mut MpvHandle,
-    render_ctx: *mut MpvRenderContext,
+    /// 渲染上下文。用原子指针而不是裸字段，是为了能不重建整个播放器就把它
+    /// 换掉（见 `recycle_render_ctx`）——所有渲染调用都在 UI 线程，
+    /// 换的时候不会有人在用。
+    render_ctx: AtomicPtr<MpvRenderContext>,
     cb_raw: *mut Box<dyn Fn() + Send>,
-    _gl_loader: Option<Arc<GlLoader>>,
+    gl_loader: Option<Arc<GlLoader>>,
+}
+
+impl MpvPlayer {
+    fn ctx(&self) -> Result<*mut MpvRenderContext, String> {
+        let p = self.render_ctx.load(Ordering::Relaxed);
+        if p.is_null() {
+            Err("渲染上下文已释放".to_string())
+        } else {
+            Ok(p)
+        }
+    }
+
+    /// 重建渲染上下文（GL 与 SW 两种模式都支持）。
+    ///
+    /// 为什么要这个：这套 libmpv（0.41 + NVIDIA）在 **渲染到外部 FBO** 的路径上，
+    /// 每渲染一帧会漏约 5KB 的 C 侧元数据（Rust 侧分配计数完全不涨，见 [mem] 行）。
+    /// 一帧 5KB × 30fps ≈ 155KB/s ≈ 1GB/小时，看两三个小时就上 GB。
+    /// 实测暂停/无视频时完全不漏，独立 `mpv --vo=gpu` 也不漏，
+    /// 说明是 render-API→FBO 这条路径上的问题（report_swap / block-for-target-time
+    /// / hwdec / cache / 缩放色彩选项都不是元凶，逐项排除过）。
+    ///
+    /// 既然桶在渲染上下文里，周期性 free+create 就能把这一段全收回来，
+    /// 而且**不影响播放进度**（mpv 的解码/解复用状态在 handle 上，不动）。
+    pub fn recycle_render_ctx(&self) -> Result<(), String> {
+        unsafe {
+            // 1) 摘掉回调再释放，避免释放过程中回调线程还在往里写
+            let old = self.render_ctx.swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !old.is_null() {
+                (self.lib.render_context_set_update_callback)(old, None, std::ptr::null_mut());
+                (self.lib.render_context_free)(old);
+            }
+            // 2) 按原模式重建
+            let mut ctx: *mut MpvRenderContext = std::ptr::null_mut();
+            if let Some(loader) = &self.gl_loader {
+                let mut gl_init = MpvOpenglInitParams {
+                    get_proc_address: gl_get_proc,
+                    get_proc_address_ctx: Arc::as_ptr(loader) as *mut c_void,
+                };
+                let api = CString::new("opengl").unwrap();
+                let mut params = [
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_API_TYPE,
+                        data: api.as_ptr() as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                        data: &mut gl_init as *mut MpvOpenglInitParams as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_INVALID,
+                        data: std::ptr::null_mut(),
+                    },
+                ];
+                let r = (self.lib.render_context_create)(&mut ctx, self.handle, params.as_mut_ptr());
+                if r < 0 {
+                    return Err(format!("重建 GL 渲染上下文失败: {}", err(&self.lib, r)));
+                }
+            } else {
+                let api = CString::new("sw").unwrap();
+                let mut params = [
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_API_TYPE,
+                        data: api.as_ptr() as *mut c_void,
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_INVALID,
+                        data: std::ptr::null_mut(),
+                    },
+                ];
+                let r = (self.lib.render_context_create)(&mut ctx, self.handle, params.as_mut_ptr());
+                if r < 0 {
+                    return Err(format!("重建 SW 渲染上下文失败: {}", err(&self.lib, r)));
+                }
+            }
+            (self.lib.render_context_set_update_callback)(
+                ctx,
+                Some(call_update),
+                self.cb_raw as *mut c_void,
+            );
+            self.render_ctx.store(ctx, Ordering::Release);
+            Ok(())
+        }
+    }
 }
 
 unsafe impl Send for MpvPlayer {}
@@ -246,6 +353,45 @@ fn err(lib: &MpvLib, code: c_int) -> String {
             format!("mpv 错误 {code}")
         } else {
             CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// 额外 mpv 选项：`DOUYU_MPV_OPTS="hwdec=no,cache=no"`。
+///
+/// 用途是**诊断/救急**：换硬解方式、关缓存、改缩放算法这些，不该为了对比改代码再编译。
+/// 逗号分隔 k=v（只写 k 视为 =yes），在下面那批默认选项之后应用，可覆盖它们。
+fn env_opts() -> Vec<(String, String)> {
+    std::env::var("DOUYU_MPV_OPTS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|kv| {
+                    let mut it = kv.splitn(2, '=');
+                    let k = it.next()?.trim().to_string();
+                    if k.is_empty() {
+                        return None;
+                    }
+                    let v = it.next().unwrap_or("yes").trim().to_string();
+                    Some((k, v))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把 (k,v) 列表设到 handle 上，失败必须报出来（静默失败的选项排查起来最费劲）
+unsafe fn apply_opts(lib: &MpvLib, handle: *mut MpvHandle, list: &[(String, String)]) {
+    for (k, v) in list {
+        let (Ok(kc), Ok(vc)) = (CString::new(k.as_str()), CString::new(v.as_str())) else {
+            logln!("[mpv] 选项 {k} 含非法字符，跳过");
+            continue;
+        };
+        let r = (lib.set_option_string)(handle, kc.as_ptr(), vc.as_ptr());
+        if r < 0 {
+            logln!("[mpv] 选项 {k}={v} 设置失败 ret={r}");
+        } else {
+            logln!("[mpv] 选项 {k}={v}（来自 DOUYU_MPV_OPTS）");
         }
     }
 }
@@ -263,22 +409,37 @@ impl MpvPlayer {
             // initialize 前的选项
             let opts: &[(&str, &str)] = &[
                 ("vo", "libmpv"),
-                ("hwdec", "nvdec-copy"),
+                // auto-copy-safe：依次探测 vaapi/nvdec/vdpau 等并自动回退软解。
+                // 之前写死 nvdec-copy，在没有 N 卡的机器上静默变成纯软解且无任何日志。
+                ("hwdec", "auto-copy-safe"),
                 ("keep-open", "yes"),
                 ("osc", "no"),
                 ("osd-bar", "no"),
                 ("border", "no"),
-                ("cache", "no"),
+                // relay 到 CDN 是公网链路，留一点缓冲抗抖动
+                // （原来的 cache=no 会把任何抖动直接顶到解码器）
+                ("cache", "auto"),
+                // 软解减负：直播画面跳过去块滤波肉眼几乎无损，省 10~20% 解码。
+                // 硬解成功时该项不生效，无副作用。
+                ("vd-lavc-skiploopfilter", "all"),
             ];
             for (k, v) in opts {
-                let k = CString::new(*k).unwrap();
-                let v = CString::new(*v).unwrap();
-                (lib.set_option_string)(handle, k.as_ptr(), v.as_ptr());
+                let kc = CString::new(*k).unwrap();
+                let vc = CString::new(*v).unwrap();
+                let r = (lib.set_option_string)(handle, kc.as_ptr(), vc.as_ptr());
+                if r < 0 {
+                    // 设置失败必须报出来：display-fps 的 ret=-5 就是这么被静默漏掉的
+                    logln!("[mpv] 选项 {k}={v} 设置失败 ret={r}");
+                }
             }
+            // 环境变量覆盖（诊断/救急：换硬解、关缓存等，不用改代码重编）
+            apply_opts(&lib, handle, &env_opts());
 
             let r = (lib.initialize)(handle);
             if r < 0 {
-                return Err(format!("mpv_initialize 失败: {}", err(&lib, r)));
+                let msg = format!("mpv_initialize 失败: {}", err(&lib, r));
+                (lib.terminate_destroy)(handle);
+                return Err(msg);
             }
 
             // 软件渲染上下文
@@ -296,7 +457,9 @@ impl MpvPlayer {
             ];
             let r = (lib.render_context_create)(&mut ctx, handle, params.as_mut_ptr());
             if r < 0 {
-                return Err(format!("创建渲染上下文失败: {}", err(&lib, r)));
+                let msg = format!("创建渲染上下文失败: {}", err(&lib, r));
+                (lib.terminate_destroy)(handle);
+                return Err(msg);
             }
 
             let cb_raw = Box::into_raw(Box::new(on_frame));
@@ -305,9 +468,9 @@ impl MpvPlayer {
             Ok(MpvPlayer {
                 lib,
                 handle,
-                render_ctx: ctx,
+                render_ctx: AtomicPtr::new(ctx),
                 cb_raw,
-                _gl_loader: None,
+                gl_loader: None,
             })
         }
     }
@@ -323,33 +486,69 @@ impl MpvPlayer {
 
             let opts: &[(&str, &str)] = &[
                 ("vo", "libmpv"),
-                ("hwdec", "nvdec-copy"),
+                // auto-copy-safe：依次探测 vaapi/nvdec/vdpau 等并自动回退软解。
+                // 之前写死 nvdec-copy，在没有 N 卡的机器上静默变成纯软解且无任何日志。
+                ("hwdec", "auto-copy-safe"),
                 ("keep-open", "yes"),
                 ("osc", "no"),
                 ("osd-bar", "no"),
                 ("border", "no"),
-                ("cache", "no"),
+                // relay 到 CDN 是公网链路，留一点缓冲抗抖动
+                // （原来的 cache=no 会把任何抖动直接顶到解码器）
+                ("cache", "auto"),
                 // GL 渲染到 FBO 时强制 sRGB + full range 输出（否则可能偏亮/发灰）
                 ("target-trc", "srgb"),
                 ("video-output-levels", "full"),
+                // 软解减负：直播画面跳过去块滤波肉眼几乎无损，省 10~20% 解码。
+                // 硬解成功时该项不生效，无副作用。
+                ("vd-lavc-skiploopfilter", "all"),
+                // 缩放/降采样用最便宜的滤镜。2K 原画缩到窗口大小是每帧
+                // 百万像素级的着色工作，bilinear 对直播画面足够
+                // （默认的 correct-downscaling 在核显/llvmpipe 上明显更贵）
+                ("scale", "bilinear"),
+                ("dscale", "bilinear"),
+                ("correct-downscaling", "no"),
+                ("linear-downscaling", "no"),
+                ("sigmoid-upscaling", "no"),
             ];
             for (k, v) in opts {
-                let k = CString::new(*k).unwrap();
-                let v = CString::new(*v).unwrap();
-                (lib.set_option_string)(handle, k.as_ptr(), v.as_ptr());
+                let kc = CString::new(*k).unwrap();
+                let vc = CString::new(*v).unwrap();
+                let r = (lib.set_option_string)(handle, kc.as_ptr(), vc.as_ptr());
+                if r < 0 {
+                    // 设置失败必须报出来：display-fps 的 ret=-5 就是这么被静默漏掉的
+                    logln!("[mpv] 选项 {k}={v} 设置失败 ret={r}");
+                }
             }
+            // 环境变量覆盖（诊断/救急：换硬解算法、关缓存等，不用改代码重编）
+            apply_opts(&lib, handle, &env_opts());
 
             // render API 模式下 mpv 感知不到显示器刷新率，调度会保守。
-            // 必须在 initialize 前用 set_option（initialize 后该属性 unavailable，ret=-11）。
+            // 实测（日志 ret=-5 = MPV_ERROR_OPTION_NOT_FOUND）：这套 libmpv 里
+            // display-fps 已不是可写选项（新版本它是自动检测的只读属性，
+            // 可写的覆盖叫 override-display-fps），逐个尝试；都失败也不影响播放
+            // —— 渲染节奏由 request_repaint_after(16ms) 驱动，不依赖 mpv 的显示时钟。
             let fps = std::env::var("DOUYU_DISPLAY_FPS").unwrap_or_else(|_| "60".to_string());
-            let k = CString::new("display-fps").unwrap();
-            let v = CString::new(fps.clone()).unwrap();
-            let r0 = (lib.set_option_string)(handle, k.as_ptr(), v.as_ptr());
-            logln!("[mpv] display-fps={fps}（set_option ret={r0}）");
+            let mut fps_set = false;
+            for name in ["display-fps", "override-display-fps"] {
+                let k = CString::new(name).unwrap();
+                let v = CString::new(fps.clone()).unwrap();
+                let r = (lib.set_option_string)(handle, k.as_ptr(), v.as_ptr());
+                logln!("[mpv] {name}={fps}（set_option ret={r}）");
+                if r >= 0 {
+                    fps_set = true;
+                    break;
+                }
+            }
+            if !fps_set {
+                logln!("[mpv] 当前 libmpv 不支持手动设置显示刷新率，忽略（不影响渲染节奏）");
+            }
 
             let r = (lib.initialize)(handle);
             if r < 0 {
-                return Err(format!("mpv_initialize 失败: {}", err(&lib, r)));
+                let msg = format!("mpv_initialize 失败: {}", err(&lib, r));
+                (lib.terminate_destroy)(handle);
+                return Err(msg);
             }
 
             // OpenGL 渲染上下文：API_TYPE="opengl" + OPENGL_INIT_PARAMS(get_proc_address)
@@ -376,7 +575,9 @@ impl MpvPlayer {
             ];
             let r = (lib.render_context_create)(&mut ctx, handle, params.as_mut_ptr());
             if r < 0 {
-                return Err(format!("创建 GL 渲染上下文失败: {}", err(&lib, r)));
+                let msg = format!("创建 GL 渲染上下文失败: {}", err(&lib, r));
+                (lib.terminate_destroy)(handle);
+                return Err(msg);
             }
 
             let cb_raw = Box::into_raw(Box::new(on_frame));
@@ -385,9 +586,9 @@ impl MpvPlayer {
             Ok(MpvPlayer {
                 lib,
                 handle,
-                render_ctx: ctx,
+                render_ctx: AtomicPtr::new(ctx),
                 cb_raw,
-                _gl_loader: Some(loader),
+                gl_loader: Some(loader),
             })
         }
     }
@@ -450,13 +651,29 @@ impl MpvPlayer {
         }
     }
 
+    /// 读字符串属性（如 hwdec-current，判断硬解到底有没有生效）。
+    /// mpv 分配的返回内存读完立即释放。
+    pub fn get_string(&self, name: &str) -> Option<String> {
+        unsafe {
+            let n = CString::new(name).ok()?;
+            let p = (self.lib.get_property_string)(self.handle, n.as_ptr());
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            (self.lib.mpv_free)(p as *mut c_void);
+            Some(s)
+        }
+    }
+
     /// 软件渲染一帧到 buf（rgb0，4 字节/像素）。
     pub fn render_sw(&self, w: usize, h: usize, buf: &mut [u8]) -> Result<(), String> {
         unsafe {
             let size: [c_int; 2] = [w as c_int, h as c_int];
             let format = CString::new("rgb0").unwrap();
             // SW_STRIDE 是 size_t*（8 字节），必须是像素大小的倍数
-            let mut stride: usize = (w * 4) as usize;
+            let mut stride: usize = w * 4;
+            let mut block: c_int = 0;
             let mut params = [
                 MpvRenderParam {
                     type_: MPV_RENDER_PARAM_SW_SIZE,
@@ -475,14 +692,20 @@ impl MpvPlayer {
                     data: buf.as_mut_ptr() as *mut c_void,
                 },
                 MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                    data: &mut block as *mut c_int as *mut c_void,
+                },
+                MpvRenderParam {
                     type_: MPV_RENDER_PARAM_INVALID,
                     data: std::ptr::null_mut(),
                 },
             ];
-            let r = (self.lib.render_context_render)(self.render_ctx, params.as_mut_ptr());
+            let ctx = self.ctx()?;
+            let r = (self.lib.render_context_render)(ctx, params.as_mut_ptr());
             if r < 0 {
                 Err(err(&self.lib, r))
             } else {
+                (self.lib.render_context_report_swap)(ctx);
                 Ok(())
             }
         }
@@ -501,6 +724,7 @@ impl MpvPlayer {
             };
             // FBO（非默认 framebuffer）渲染不需要翻转
             let mut flip: c_int = 0;
+            let mut block: c_int = 0;
             let mut params = [
                 MpvRenderParam {
                     type_: MPV_RENDER_PARAM_OPENGL_FBO,
@@ -511,14 +735,22 @@ impl MpvPlayer {
                     data: &mut flip as *mut c_int as *mut c_void,
                 },
                 MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                    data: &mut block as *mut c_int as *mut c_void,
+                },
+                MpvRenderParam {
                     type_: MPV_RENDER_PARAM_INVALID,
                     data: std::ptr::null_mut(),
                 },
             ];
-            let r = (self.lib.render_context_render)(self.render_ctx, params.as_mut_ptr());
+            let ctx = self.ctx()?;
+            let r = (self.lib.render_context_render)(ctx, params.as_mut_ptr());
             if r < 0 {
                 Err(err(&self.lib, r))
             } else {
+                // 报告「已上屏」：正规嵌入式用法（虽然实测它并不是这个泄漏的元凶，
+                // 但不报告会让 mpv 的帧计时一直等不到呈现时刻）
+                (self.lib.render_context_report_swap)(ctx);
                 Ok(())
             }
         }
@@ -528,8 +760,11 @@ impl MpvPlayer {
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         unsafe {
-            (self.lib.render_context_set_update_callback)(self.render_ctx, None, std::ptr::null_mut());
-            (self.lib.render_context_free)(self.render_ctx);
+            let ctx = self.render_ctx.swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if !ctx.is_null() {
+                (self.lib.render_context_set_update_callback)(ctx, None, std::ptr::null_mut());
+                (self.lib.render_context_free)(ctx);
+            }
             (self.lib.terminate_destroy)(self.handle);
             drop(Box::from_raw(self.cb_raw));
         }

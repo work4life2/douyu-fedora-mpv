@@ -9,7 +9,7 @@
 //! 登录态能解锁原画（60fps）并避免斗鱼每 5 分钟断流。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::logln;
@@ -22,7 +22,7 @@ const LOGIN_REFERER: &str = "https://passport.douyu.com/index/login";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 登录链路专用 HTTP agent（**必须显式挂 TLS**）。
+/// 登录链路复用的 HTTP agent（**必须显式挂 TLS**）。
 ///
 /// ureq 2.x 的 `default_tls_config()` 只认 `tls`（rustls）这个 feature；本项目
 /// Cargo.toml 开的是 `native-tls`，所以 `AgentBuilder::new()` 在没显式
@@ -30,15 +30,33 @@ const REQ_TIMEOUT: Duration = Duration::from_secs(15);
 ///   "cannot make HTTPS request because no TLS backend is configured"
 /// 这就是「扫码确认后换登录态必失败」的根因（生成二维码/轮询走的是
 /// `douyu::agent()`，那里设过 tls_connector，所以看起来前半段一切正常）。
-fn agent(redirects: u32) -> Result<ureq::Agent, String> {
+///
+/// agent 要缓存复用：poll() 每 2 秒一次，之前每次调用都新建 TlsConnector + Agent，
+/// 等于扫码期间每 2 秒重新加载一遍系统根证书再重新 TLS 握手。ureq 的 Agent
+/// 自带连接池且线程安全，redirects 只有 0/5 两种用法，各缓存一个。
+static AGENT_REDIRECT: OnceLock<ureq::Agent> = OnceLock::new();
+static AGENT_NOREDIRECT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn agent(redirects: u32) -> Result<&'static ureq::Agent, String> {
+    let slot = if redirects == 0 {
+        &AGENT_NOREDIRECT
+    } else {
+        &AGENT_REDIRECT
+    };
+    if let Some(a) = slot.get() {
+        return Ok(a);
+    }
     let tls = native_tls::TlsConnector::new().map_err(|e| format!("TLS 初始化失败: {e}"))?;
-    Ok(ureq::AgentBuilder::new()
+    let a = ureq::AgentBuilder::new()
         .redirects(redirects)
         .try_proxy_from_env(false)
         .tls_connector(Arc::new(tls))
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(REQ_TIMEOUT)
-        .build())
+        .build();
+    // 并发竞争时后写者赢，无碍（构建是幂等的）；此时 get() 必有值
+    let _ = slot.set(a);
+    Ok(slot.get().expect("agent 刚初始化过"))
 }
 
 pub struct QrSession {
@@ -83,7 +101,7 @@ pub fn generate() -> Result<QrSession, String> {
         .as_str()
         .ok_or("二维码响应缺少 url")?
         .to_string();
-    logln!("[login] 二维码已生成（code={}）", &code[..code.len().min(24)]);
+    logln!("[login] 二维码已生成（code={}）", crate::log::head(&code, 24));
     Ok(QrSession { code, url })
 }
 
@@ -276,16 +294,6 @@ fn short_url(u: &str) -> String {
         Some(i) => (&u[..i], Some(&u[i + 1..])),
         None => (u, None),
     };
-    let masked_base = if let Some(i) = base.find("://") {
-        let scheme = &base[..i];
-        let rest = &base[i + 3..];
-        let host_end = rest.find('/').unwrap_or(rest.len());
-        format!("{scheme}://{}", &rest[..host_end.max(1).min(rest.len())])
-            .to_string()
-            + &rest[host_end..]
-    } else {
-        base.to_string()
-    };
     match query {
         Some(q) if !q.is_empty() => {
             let names: Vec<String> = q
@@ -295,9 +303,9 @@ fn short_url(u: &str) -> String {
                     format!("{k}=***")
                 })
                 .collect();
-            format!("{masked_base}?{}", names.join("&"))
+            format!("{base}?{}", names.join("&"))
         }
-        _ => masked_base,
+        _ => base.to_string(),
     }
 }
 
@@ -344,8 +352,25 @@ fn cookie_candidates() -> Vec<PathBuf> {
     v
 }
 
-/// 读登录态：多个候选里取「最近修改」的那个（save 可能已回退到 XDG 目录）
+/// 读登录态（带内存缓存）：多个候选里取「最近修改」的那个（save 可能已回退到 XDG 目录）。
+///
+/// 缓存的原因：一次取流链路要查 3 次（current_did / 日志 / post），
+/// 每次都读两个候选文件 + metadata；缓存后只在首次和 save 后读盘。
+static COOKIE_CACHE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+
+fn cookie_cache() -> &'static Mutex<Option<Option<String>>> {
+    COOKIE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
 pub fn load_cookie() -> Option<String> {
+    let mut g = cookie_cache().lock().unwrap();
+    if g.is_none() {
+        *g = Some(read_cookie_from_disk());
+    }
+    g.as_ref().unwrap().clone()
+}
+
+fn read_cookie_from_disk() -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for p in cookie_candidates() {
         let Ok(s) = std::fs::read_to_string(&p) else {
@@ -374,6 +399,8 @@ pub fn save_cookie(c: &str) -> Option<PathBuf> {
         match std::fs::write(&p, c) {
             Ok(()) => {
                 logln!("[login] cookie 已写入 {}", p.display());
+                // 落盘成功后同步刷新内存缓存，避免读到旧值
+                *cookie_cache().lock().unwrap() = Some(Some(c.to_string()));
                 return Some(p);
             }
             Err(e) => logln!("[login] cookie 写入 {} 失败: {e}", p.display()),
@@ -462,7 +489,11 @@ pub fn normalize_cookie(raw: &str) -> Result<String, String> {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let cleaned = joined.replace("; ", "; ").replace(";;", ";");
+    // 压掉连续分号和分号前多余空格（原来的 replace("; ", "; ") 两边相同，是无操作）
+    let cleaned = joined
+        .replace(";;", ";")
+        .replace(" ;", ";")
+        .replace(";  ", "; ");
     if cookie_value(&cleaned, "acf_uid").is_none() {
         return Err("缺少 acf_uid，请从已登录的斗鱼网页复制完整 Cookie 请求头".into());
     }

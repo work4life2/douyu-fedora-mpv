@@ -148,12 +148,18 @@ impl Relay {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                if let Ok(stream) = conn {
-                    if let Err(e) = self.handle(stream) {
+            for stream in listener.incoming().flatten() {
+                // 每个连接单独一个线程。handle 是长连接（转发整个直播流），
+                // 之前串行 accept：播放器 loadfile 切换时新连接要等旧连接结束，
+                // 而旧连接可能因为对端不再读取而卡在 write_all 上 ——
+                // 表现为「换房/换画质偶尔永久卡住」。
+                let state = self.state.clone();
+                std::thread::spawn(move || {
+                    let relay = Relay { state };
+                    if let Err(e) = relay.handle(stream) {
                         logln!("[relay] 连接结束: {e}");
                     }
-                }
+                });
             }
         });
         Ok(port)
@@ -166,6 +172,11 @@ impl Relay {
 
     fn handle(&self, mut stream: TcpStream) -> Result<(), String> {
         logln!("[relay] 播放器已连接");
+        // 对端停止读取（切流/暂停/被杀）时写不能永久阻塞：5 秒写不出去就放弃这条连接。
+        // 否则线程和 CDN 源会一直挂着（现在每连接一线程，泄漏的线程数会随切换次数累积）。
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        // 直播流要低延迟，关 Nagle
+        let _ = stream.set_nodelay(true);
         // 读 HTTP 请求头
         let mut buf = [0u8; 4096];
         let mut req = Vec::new();
@@ -202,9 +213,15 @@ impl Relay {
         let mut next_renew = Instant::now() + STREAM_TTL - RENEW_LEAD;
 
         loop {
-            // 房间/画质变化 → 无缝切流
-            let want = self.state.lock().unwrap().clone();
-            if want != current && !want.0.is_empty() {
+            // 房间/画质变化 → 无缝切流。
+            // 这个循环每个 FLV tag 都要过一遍（视频+音频约 100+ tag/秒），
+            // 用借用比较代替克隆：别为 99.99% 的「没变化」付一次 String 分配。
+            let changed = {
+                let g = self.state.lock().unwrap();
+                !g.0.is_empty() && *g != current
+            };
+            if changed {
+                let want = self.state.lock().unwrap().clone();
                 logln!(
                     "[relay] 切流: rid={}\u{2192}{}, quality={}\u{2192}{}",
                     current.0, want.0, current.1, want.1
@@ -215,7 +232,9 @@ impl Relay {
                     .and_then(|s| FlvSource::open(&s.url))
                 {
                     Ok(mut new_src) => {
-                        self.splice(&mut new_src, old_vts, &mut stream)?;
+                        // 换档/换房：编码参数（分辨率/SPS/PPS）都变了，
+                        // 新流的 script tag 和 sequence header 必须转发
+                        self.splice(&mut new_src, old_vts, &mut stream, true)?;
                         src = new_src;
                         renewal = None;
                         next_renew = Instant::now() + STREAM_TTL - RENEW_LEAD;
@@ -258,7 +277,8 @@ impl Relay {
                         },
                     };
                     logln!("[relay] 接续新流...");
-                    self.splice(&mut new_src, old_vts, &mut stream)?;
+                    // 续流（同 rid 同档位）：码流参数没变，重复头直接丢
+                    self.splice(&mut new_src, old_vts, &mut stream, false)?;
                     logln!("[relay] 接续完成（新流 ts={}）", new_src.video_ts);
                     src = new_src;
                     next_renew = Instant::now() + STREAM_TTL - RENEW_LEAD;
@@ -267,18 +287,32 @@ impl Relay {
         }
     }
 
-    /// 接续：丢弃 script/seq header/已过期 tag，从视频关键帧接上。
+    /// 接续：从视频关键帧接上。
+    ///
+    /// `forward_headers`：
+    /// - 续流（同参数）= false：丢掉重复的 script tag / sequence header，
+    ///   避免播放器为同样的解码配置做一次无谓的重初始化；
+    /// - 换画质/换房 = true：分辨率和 SPS/PPS 都变了，**必须**转发新的
+    ///   script tag 和 sequence header，否则播放器按旧配置解新码流 → 花屏。
+    ///   （换房通常伴随 loadfile 重连，真正吃到这条路径的是换画质——设计上它不重连。）
+    ///
     /// 保护：若丢弃超过 3MB 仍未找到关键帧（时间戳可能重置），放弃过滤直接转发。
     fn splice(
         &self,
         new_src: &mut FlvSource,
         old_video_ts: u32,
         stream: &mut TcpStream,
+        forward_headers: bool,
     ) -> Result<(), String> {
         let mut started = false;
         let mut discarded: usize = 0;
         while let Some(tag) = new_src.read_tag()? {
             if tag.is_script() || tag.is_sequence_header() {
+                if forward_headers {
+                    stream
+                        .write_all(&tag_to_bytes(&tag))
+                        .map_err(|e| e.to_string())?;
+                }
                 continue;
             }
             if !started {
@@ -303,7 +337,6 @@ impl Relay {
                 .write_all(&tag_to_bytes(&tag))
                 .map_err(|e| e.to_string())?;
         }
-        let _ = old_video_ts;
         Ok(())
     }
 }

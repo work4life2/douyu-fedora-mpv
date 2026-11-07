@@ -4,13 +4,14 @@ Rust 写的原生斗鱼直播客户端。**单窗口**：视频内嵌在 GUI 里
 
 ## 特性
 
-- **视频内嵌单窗口**：libmpv 软件渲染 → egui 纹理显示，视频和 UI 在同一个窗口（可调大小、f/双击全屏）。
+- **视频内嵌单窗口**：libmpv 渲染（OpenGL 零拷贝优先，失败回退软件渲染）→ egui 纹理显示，视频和 UI 在同一个窗口（可调大小、f/双击全屏）。
 - **双击启动，GUI 输入房间号**：粘贴直播间链接也行，回车或点「确定」即播。
 - **记住上次的直播间**：退出后再打开直接接着看，房间号、画质、弹幕开关都沿用上次（配置文件见下）。
 - **播放时不待机**：默认开启，看完不因为屏保/自动休眠黑屏中断；侧边栏可随时关掉。
 - **侧边栏画质按钮**：原画/蓝光4M/超清/高清，点击无缝切换。
 - **实时弹幕**：egui 直接叠在视频上（不经过 libass），可开关；密集时按车道排程不重叠。
-- **NVDEC 硬解**：hwdec=nvdec-copy。
+- **硬解自动选择**：hwdec=auto-copy-safe（vaapi/nvdec/vdpau 依次探测，失败自动回退软解）。实际生效值看日志 `[fps]` 行末尾的「硬解」字段——之前写死 nvdec 时探测失败完全无感知。
+- **按显示区选档**：加载房间时按视频区宽度封顶取流档位（<1100px 取超清、<1700px 取蓝光、再大才取原画）。900px 宽的窗口解码 1440p 原画 = 解码面积 8 倍于显示，纯浪费算力。点侧边栏画质按钮随时可手动改回。
 - **无缝续流**：本地 FLV 中转，解决 300 秒强制断开（无需登录）。
 - **扫码登录**：侧边栏「扫码登录」→ 手机斗鱼 App 扫码确认，登录态存本地，解锁原画并减少断流；也支持手动粘贴 Cookie。
 - **中文字体**：自动加载系统 Noto Sans CJK。
@@ -83,6 +84,64 @@ KDE（PowerDevil）/GNOME 都认。三条要点：
 
 没有 `systemd-inhibit`（非 systemd 发行版）时侧边栏会标红说明原因，不影响播放。
 
+## 内存（实测与看门狗）
+
+症状：开播约 300MB，看一小时涨到 1.4GB。已在真机复现并定位到 **libmpv 的
+render-API→外部 FBO 路径**，不是本项目的 Rust 代码。
+
+### 实测数据
+
+用内置的 `[mem]` 诊断行（每秒一行）在真机（mpv 0.41 + GTX 1650S）上量：
+
+| 场景 | RSS 增速 | 备注 |
+|---|---|---|
+| 不开播（只有 UI，60fps 重绘） | 0 KB/s | `[heap]` 完全不动，Rust 活字节 96.0MB 恒定 |
+| 播放 1280×720@30，渲染到 904×508 | +280 KB/s | 堆 +155 KB/s |
+| 播放 1920×1080@30，渲染到 1703×957 | +300 KB/s | ≈1.1GB/小时，和「一小时 1.4G」吻合 |
+| `pause=yes`（流已连，不解码不渲染） | 0 KB/s | **只有帧真往下走才漏** |
+| `hwdec=no`（纯软解） | +155 KB/s | 与硬解无关 |
+| `ao=null`（不出声） | +172 KB/s | 与音频无关 |
+| 独立 `mpv --vo=gpu` 自己的窗口 | 0 KB/s（50 秒共 +240KB） | mpv 本身不漏 |
+
+结论：**每渲染一帧固定漏约 5 KB C 侧内存**（两种分辨率下都是 5.1KB/帧，与像素数无关），
+桶在 `mpv_render_context` 里。已逐项排除：`report_swap`、`block-for-target-time`、
+`gpu-api=opengl`、`target-trc`/`video-output-levels`、`cache`、缩放算法、音频、网络。
+同一时间段内 Rust 侧分配计数（`[mem]` 的「Rust 活」）**一个字节都没涨**。
+
+### 处理：渲染上下文定期重建
+
+有画面后记 RSS 基线，涨过 `MEM_GROWTH_MB`（默认 300MB，约 15~20 分钟）就
+`mpv_render_context_free` + `create` 重建一次渲染上下文，泄漏对象随之释放。
+**不影响播放进度**——解码/解复用状态在 mpv handle 上，不动。
+
+实测（强制 20 秒重建一次）：RSS 651MB → 539MB 一次性回落，之后稳定在 545MB 不再爬。
+
+```bash
+DOUYU_MEM_LIMIT_MB=200 ./douyu   # 更激进地回收
+DOUYU_RC_RECYCLE=20 ./douyu      # 调试：固定周期重建，肉眼可见 RSS 锯齿
+```
+
+> 真正的修法在 mpv 侧（换 `--wid` 嵌入或等上游修 render API），
+> 这里是可控的兜底，代价是每次重建有一下极短的画面停顿。
+
+### `[mem]` 诊断行
+
+```
+[mem] Rust 活 96.0MB/1537块 (+2KB/s) | RSS 545MB (+0KB/s) | 最大档 32MB=93.5MB ...
+```
+
+- **Rust 活**：全局分配器统计的活字节/块数。一路涨 = 我们自己漏；平的 = 不是我们。
+- **RSS**：读 `/proc/self/statm`。
+- **最大档**：活字节最大的尺寸档。这里的 93.5MB 是 Noto Sans CJK 字体文件本身，
+  想再省 ~90MB 可以换子集字体。
+
+诊断/救急还可以直接往 mpv 塞选项，不用改代码重编：
+
+```bash
+DOUYU_MPV_OPTS="hwdec=no,cache=no" ./douyu
+```
+
+
 ### 登录排障
 
 同目录 `douyu.log` 里所有登录动作都带 `[login]` 前缀，出问题先看那里：
@@ -124,7 +183,7 @@ egui (eframe) 单窗口
    ├─ 侧边栏：画质按钮 / 弹幕开关 / 待机开关 / 全屏
    ├─ 顶部：房间号输入 + 确定
    │
-   ├─ mpvffi.rs   libmpv dlopen FFI：vo=libmpv + hwdec=nvdec-copy + render(SW)
+   ├─ mpvffi.rs   libmpv dlopen FFI：vo=libmpv + hwdec=auto-copy-safe + render API（GL 零拷贝优先）
    ├─ relay.rs    续流中转：本地 HTTP + FLV tag 拼接（300s 断流解法）
    ├─ danmaku.rs  弹幕：WSS(TLS1.2/openssl) + STT 协议（字节级零拷贝解析）
    ├─ login.rs    扫码登录：generateCode + 轮询 + 回调逐跳收 Cookie

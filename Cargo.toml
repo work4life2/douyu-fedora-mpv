@@ -21,7 +21,11 @@ qrcode = "0.14"
 png = "0.17"
 
 [profile.release]
-opt-level = "z"     # 体积优先
-lto = true          # 链接期优化，进一步减小体积
+# 之前用 opt-level="z"（体积优先）：它会关掉循环向量化和内联，而本项目的热路径
+# 恰好全是逐字节/逐像素循环（FLV 解析、弹幕字段查找、颜色转换、egui tessellation）。
+# 体积只差 1~2MB，换这些循环 20~50% 的速度，不划算。
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 strip = true        # 去掉符号
 panic = "abort"     # 去掉 unwind 开销

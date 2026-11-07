@@ -18,8 +18,15 @@ pub fn sign(rid: &str, did: &str, tt: i64, script: &str) -> Result<String, Strin
         // 2. 加载房间签名脚本
         ctx.eval::<(), _>(script)
             .map_err(|e| format!("签名脚本执行失败: {e}"))?;
-        // 3. 调用签名函数
-        let expr = format!("ub98484234('{rid}','{did}','{tt}')");
+        // 3. 调用签名函数。rid/did 来自外部（命令行参数 / cookie），
+        //    不能直接拼进 JS 表达式——值里带个单引号就能注入任意代码。
+        //    先过滤到安全字符集（真实的 rid/did 都是十六进制数字串，不受影响）。
+        let safe = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect()
+        };
+        let expr = format!("ub98484234('{}','{}','{tt}')", safe(rid), safe(did));
         ctx.eval::<String, _>(expr.as_str())
             .map_err(|e| format!("签名计算失败: {e}"))
     })

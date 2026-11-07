@@ -5,9 +5,10 @@
 //! 退出后记住上次的直播间/画质/弹幕开关，下次直接接着看。
 //!
 //! 视频：libmpv 渲染（dlopen libmpv.so.2，优先 GL 零拷贝）→ egui 纹理显示。
-//! 硬解：hwdec=nvdec-copy。弹幕：egui 画在视频层上（车道排程 + 密度自适应。
+//! 硬解：auto-copy-safe（vaapi/nvdec 自动探测，失败回退软解）。弹幕：egui 画在视频层上（车道排程 + 密度自适应）。
 //! 续流：本地 FLV 中转解决 300s 断流。
 
+mod alloc_stat;
 mod config;
 mod danmaku;
 mod douyu;
@@ -17,6 +18,10 @@ mod mpvffi;
 mod power;
 mod relay;
 mod sign;
+
+/// 计数分配器：只为把「Rust 活字节」和「RSS」分开看（见 alloc_stat）
+#[global_allocator]
+static ALLOC: alloc_stat::Counting = alloc_stat::Counting;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +40,10 @@ const QUEUE_CAP: usize = 400;
 const INTAKE_PER_FRAME: usize = 16;
 /// 屏幕上同时在飞的弹幕条数硬上限
 const MAX_ITEMS: usize = 200;
+/// 内存看门狗阈值：有画面后 RSS 比基线涨这么多就重建渲染上下文。
+/// 这套 libmpv 渲染外部 FBO 时每帧漏约 5KB（约 1GB/小时），
+/// 取 300MB 意味着正常观看大约 20~30 分钟回收一次，用户无感。
+const MEM_GROWTH_MB: u64 = 300;
 
 /// 密度档位表：(字号系数, 横穿整屏秒数)。
 /// 弹幕越密 → 字号越小（车道变多）+ 移动越快（车道腾空更快），两者相乘才够吞吐。
@@ -118,6 +127,10 @@ struct DouyuApp {
     // OpenGL 渲染（零拷贝）；None 表示回退软件渲染
     gl: Option<Arc<glow::Context>>,
     gl_video: Option<GlVideoTarget>,
+    /// resize 防抖：拖动窗口时目标尺寸逐帧变化，等尺寸稳定后再重建纹理/FBO，
+    /// 否则每帧 delete+create 纹理外加一次全量初始化上传，拖动直接卡成幻灯片
+    pending_size: Option<(usize, usize)>,
+    size_stable_at: Option<Instant>,
 
     // 视频纹理（GL 模式用 gl_video.tex_id，SW 模式用 video_tex）
     video_tex: Option<egui::TextureHandle>,
@@ -125,7 +138,8 @@ struct DouyuApp {
     frame_w: usize,
     frame_h: usize,
     frame_ready: bool,
-    #[allow(dead_code)] // mpv callback 仍写此标志，渲染由持续循环驱动
+    /// mpv 有新帧时置位（回调线程写），渲染前消费。渲染节奏由
+    /// request_repaint_after(16ms) 驱动，这个标志只用于「没新帧就不重绘纹理」。
     need_frame: Arc<AtomicBool>,
     render_err_logged: bool,
     render_ok_logged: bool,
@@ -173,6 +187,12 @@ struct DouyuApp {
     sleep: power::SleepInhibitor,
     /// 首帧自动恢复上次的直播间
     autostart: bool,
+    /// 上一秒内存快照 (Rust 活字节, RSS_KB)，用于计算增速
+    mem_snap: (u64, u64),
+    /// 有画面后的 RSS 基线（KB），0 = 还没建立（内存看门狗用）
+    rss_base: u64,
+    /// 上次重建渲染上下文的时刻
+    rc_recycled_at: Instant,
 }
 
 impl DouyuApp {
@@ -264,6 +284,8 @@ impl DouyuApp {
             lib_err,
             gl,
             gl_video: None,
+            pending_size: None,
+            size_stable_at: None,
             video_tex: None,
             frame_buf: Vec::new(),
             frame_w: 0,
@@ -298,6 +320,33 @@ impl DouyuApp {
             cfg,
             sleep,
             autostart: !last.is_empty(),
+            mem_snap: (0, 0),
+            rss_base: 0,
+            rc_recycled_at: Instant::now(),
+        }
+    }
+
+    /// 按显示区宽度封顶取流档位：解码分辨率远超显示区时，多出来的像素
+    /// 全部在缩放里丢掉（904px 窗口看 1440p 原画 = 解码面积 8 倍于显示，
+    /// 87.5% 的解码算力每秒白烧 60 次）。只降不升：用户主动选低档（省流量）就尊重。
+    fn display_capped_quality(&self, want: i32) -> i32 {
+        let auto_max = if self.vw_last < 1100.0 {
+            3 // 超清
+        } else if self.vw_last < 1700.0 {
+            4 // 蓝光4M
+        } else {
+            0 // 原画
+        };
+        let rank = |r: i32| match r {
+            0 => 3,  // 原画
+            4 => 2,  // 蓝光4M
+            3 => 1,  // 超清
+            _ => 0,  // 高清
+        };
+        if rank(auto_max) < rank(want) {
+            auto_max
+        } else {
+            want
         }
     }
 
@@ -330,8 +379,16 @@ impl DouyuApp {
         self.idle_windows = 0;
         self.reset_lanes();
 
-        // 换流（relay 检测状态变化无缝切流）+ 播放
-        *self.stream_state.lock().unwrap() = (rid.clone(), self.cfg.quality);
+        // 换流（relay 检测状态变化无缝切流）+ 播放。
+        // 档位按显示区封顶：小区窗口解码 2K 原画纯属浪费（见 display_capped_quality）
+        let rate = self.display_capped_quality(self.cfg.quality);
+        if rate != self.cfg.quality {
+            logln!(
+                "[room] 显示区宽 {:.0}px，原画无收益，自动取流降档 rate={}（点侧边栏画质按钮可手动改回）",
+                self.vw_last, rate
+            );
+        }
+        *self.stream_state.lock().unwrap() = (rid.clone(), rate);
         let url = self.relay_url.clone();
         // 直接调用（mpv_command 本身很快，不要 spawn+join 阻塞 UI 线程）
         if let Err(e) = self.player.as_ref().unwrap().loadfile(&url) {
@@ -383,6 +440,11 @@ impl DouyuApp {
         });
 
         self.status = format!("正在播放房间 {rid}");
+
+        // 换房重开一条播放链路：内存基线和回收计时都要重置，
+        // 否则会拿着上个房间的高基线立刻触发一次无谓的重建
+        self.rss_base = 0;
+        self.rc_recycled_at = Instant::now();
 
         // 调试：合成弹幕洪水，肉眼验证密集场景（真热房在游客态常被限流，测不出密度）
         if let Ok(v) = std::env::var("DOUYU_STRESS") {
@@ -663,6 +725,10 @@ impl DouyuApp {
     fn drain_danmaku(&mut self, ctx: &egui::Context) {
         if !self.danmaku_on.load(Ordering::Relaxed) {
             self.danmaku_queue.lock().unwrap().clear();
+            // 关闭期间生产者还在往满队列里丢（计数只增不减），必须持续消费掉：
+            // 否则重新打开的一瞬间 drops_window 爆表，密度档位直接跳到最高
+            let _ = self.danmaku_cap_drops.swap(0, Ordering::Relaxed);
+            self.drops_window = 0;
             if !self.danmaku_list.is_empty() {
                 self.danmaku_list.clear();
                 self.reset_lanes();
@@ -688,6 +754,13 @@ impl DouyuApp {
         }
         for (_nn, txt) in batch {
             self.push_danmaku(ctx, &txt, now);
+        }
+        // 在屏条数截断放在整批之后一次做：逐条 push 就头部删一条是 O(n) memmove，
+        // 密集时每帧 16 次 × 200 条元素的搬移；drain 一批只搬一次。
+        // 单帧内短暂超过上限十来条，下一帧就截回去，肉眼无感。
+        if self.danmaku_list.len() > MAX_ITEMS {
+            let excess = self.danmaku_list.len() - MAX_ITEMS;
+            self.danmaku_list.drain(..excess);
         }
         self.tune_density(now);
     }
@@ -729,9 +802,6 @@ impl DouyuApp {
             galley_size: fs,
             width: w,
         });
-        if self.danmaku_list.len() > MAX_ITEMS {
-            self.danmaku_list.remove(0);
-        }
     }
 
     /// 按丢帧情况自适应密度档位：热房自动缩字提速，人少了再涨回来
@@ -945,12 +1015,31 @@ impl DouyuApp {
             None => return,
         };
 
-        let need_recreate = match &self.gl_video {
+        let mut need_recreate = match &self.gl_video {
             Some(t) => t.w != w || t.h != h,
             None => true,
         };
         if need_recreate {
-            self.recreate_gl_target(&gl, w, h, frame);
+            // 拖动窗口时目标尺寸逐帧都在变，逐帧重建纹理+FBO（含 w*h*4 的
+            // 初始化上传）就是「拖窗口卡成幻灯片」的根因。等尺寸稳定 150ms
+            // 再重建，这几帧沿用旧纹理（egui 按显示矩形拉伸，肉眼无感）。
+            let now = Instant::now();
+            let stable = match (self.pending_size, self.size_stable_at) {
+                (Some(sz), Some(at)) => sz == (w, h) && now >= at,
+                _ => false,
+            };
+            if stable || self.gl_video.is_none() {
+                self.recreate_gl_target(&gl, w, h, frame);
+                self.pending_size = None;
+                self.size_stable_at = None;
+            } else {
+                if self.pending_size != Some((w, h)) {
+                    self.pending_size = Some((w, h));
+                    self.size_stable_at = Some(now + Duration::from_millis(150));
+                }
+                // 尺寸未稳定：这帧不重建，也不按新尺寸渲染
+                need_recreate = false;
+            }
         }
 
         // 只在 mpv 有新帧时渲染（无新帧复用上一帧纹理，避免 GPU 空转）
@@ -959,11 +1048,13 @@ impl DouyuApp {
             return;
         }
 
-        let fbo = match &self.gl_video {
-            Some(t) => t.fbo,
+        // 渲染尺寸取纹理的实际尺寸：防抖窗口期纹理还是旧的，
+        // 按新尺寸渲染进旧纹理会写出 FBO 边界
+        let (tw, th, fbo) = match &self.gl_video {
+            Some(t) => (t.w, t.h, t.fbo),
             None => return,
         };
-        if let Err(e) = player.render_gl(fbo.0.get() as i32, w, h) {
+        if let Err(e) = player.render_gl(fbo.0.get() as i32, tw, th) {
             if !self.render_err_logged {
                 self.render_err_logged = true;
                 logln!("[video] GL 渲染失败（只报一次）: {e}");
@@ -972,16 +1063,30 @@ impl DouyuApp {
         }
         if !self.render_ok_logged {
             self.render_ok_logged = true;
-            logln!("[video] GL 首帧渲染成功 {}x{}", w, h);
+            logln!("[video] GL 首帧渲染成功 {}x{}", tw, th);
         }
-        self.frame_w = w;
-        self.frame_h = h;
+        self.frame_w = tw;
+        self.frame_h = th;
         self.frame_ready = true;
     }
 
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
+    /// 释放 GL 视频目标（FBO + 纹理）。重建渲染上下文前必须走这里：
+    /// 直接 `gl_video = None` 会把纹理/FBO 丢在显存里没人删。
+    fn drop_gl_target(&mut self) {
+        let Some(t) = self.gl_video.take() else {
+            return;
+        };
+        if let Some(gl) = &self.gl {
+            unsafe {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
+        }
     }
 }
 
@@ -993,16 +1098,6 @@ impl Drop for DouyuApp {
 
 impl eframe::App for DouyuApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // 首帧恢复上次的直播间（等中转/播放器都就绪后再加载）
-        if self.autostart {
-            self.autostart = false;
-            let rid = self.room_input.trim().to_string();
-            if !rid.is_empty() {
-                logln!("[room] 自动恢复上次直播间 {rid}");
-                self.load_room(ctx);
-            }
-        }
-
         self.drain_danmaku(ctx);
 
         // 待机抑制自愈：开关开着但进程被系统杀了（挂起唤醒后很常见）→ 重新拉起
@@ -1143,6 +1238,10 @@ impl eframe::App for DouyuApp {
                 let avail = ui.available_size();
                 // 视频按 16:9 fit 到可用区域（保持比例，尽可能大）
                 let (vw, vh) = fit_169(avail);
+                // 每帧记录视频区逻辑尺寸：换房时「按显示区选档」要用
+                //（draw_danmaku 里也写同值，幂等）
+                self.vw_last = vw;
+                self.vh_last = vh;
                 // 渲染纹理尺寸：同比例，上限 1080p（显示时等比放大无失真）
                 let scale = (1920.0 / vw).min(1080.0 / vh).min(1.0);
                 let rw = ((vw * scale) as usize).clamp(320, 1920);
@@ -1158,7 +1257,9 @@ impl eframe::App for DouyuApp {
                             size: [rw, rh],
                             pixels: self
                                 .frame_buf
-                                .chunks_exact(4)
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
                                 .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .collect(),
                         };
@@ -1205,6 +1306,17 @@ impl eframe::App for DouyuApp {
                     });
                 }
             });
+
+        // 首帧恢复上次的直播间：放在中央面板之后，让「按显示区选档」
+        // 用第一帧布局出来的真实视频区宽度，而不是默认值 1280
+        if self.autostart {
+            self.autostart = false;
+            let rid = self.room_input.trim().to_string();
+            if !rid.is_empty() {
+                logln!("[room] 自动恢复上次直播间 {rid}");
+                self.load_room(ctx);
+            }
+        }
 
         // 全局快捷键：f 全屏 / ESC 退出全屏
         let toggle = ctx.input(|i| {
@@ -1351,6 +1463,7 @@ impl eframe::App for DouyuApp {
             self.last_fps = self.frame_count as f32 / fe.as_secs_f32();
             let (mut est, mut cont, mut vw, mut vh) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let (mut drops, mut dec_drops, mut mistimed) = (0.0f64, 0.0f64, 0.0f64);
+            let mut hwdec = String::new();
             if let Some(p) = &self.player {
                 est = p.get_f64("estimated-frame-rate").unwrap_or(0.0);
                 cont = p.get_f64("container-fps").unwrap_or(0.0);
@@ -1360,6 +1473,9 @@ impl eframe::App for DouyuApp {
                 drops = p.get_f64("frame-drop-count").unwrap_or(0.0);
                 dec_drops = p.get_f64("decoder-frame-drop-count").unwrap_or(0.0);
                 mistimed = p.get_f64("mistimed-frame-count").unwrap_or(0.0);
+                // 硬解是否真的生效（hwdec=auto 后这是第一个该盯的诊断量：
+                // 探测失败会静默回退软解，之前写死 nvdec 时完全无感知）
+                hwdec = p.get_string("hwdec-current").unwrap_or_default();
                 self.source_fps = if est > 0.5 { est as f32 } else { cont as f32 };
             }
             // 弹幕运行态（一次性取齐，避免在 logln 参数里混合可变/不可变借用）
@@ -1373,7 +1489,7 @@ impl eframe::App for DouyuApp {
             };
             let awake = if self.cfg.prevent_sleep { awake } else { "关" };
             logln!(
-                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 丢帧 输出{:.0}/解码{:.0}/错时{:.0} | 尺寸 {}x{} | rate={} | 弹幕 在屏{} 车道 {}/{} 空闲 密度{} 累计丢弃{} | 待机抑制 {awake}",
+                "[fps] 渲染 {:.1} | 源 {} (est={:.1} cont={:.1}) | 视频 {:.0}x{:.0} | 丢帧 输出{:.0}/解码{:.0}/错时{:.0} | 尺寸 {}x{} | rate={} | 弹幕 在屏{} 车道 {}/{} 空闲 密度{} 累计丢弃{} | 待机抑制 {awake} | 硬解 {hwdec}",
                 self.last_fps,
                 if self.source_fps > 0.5 {
                     format!("{:.1}", self.source_fps)
@@ -1396,6 +1512,83 @@ impl eframe::App for DouyuApp {
                 self.dense,
                 self.drops_total
             );
+            // 内存诊断：Rust 活字节 vs RSS。
+            // 活字节涨 = 我们自己漏；活字节平而 RSS 涨 = mpv/GL 或 glibc 碎片。
+            let (live_b, live_n) = alloc_stat::live();
+            let rss = alloc_stat::rss_kb();
+            let (pb, pr) = self.mem_snap;
+            self.mem_snap = (live_b, rss);
+            let (db, dr) = if pb == 0 {
+                (0, 0)
+            } else {
+                (live_b as i64 - pb as i64, rss as i64 - pr as i64)
+            };
+            let buckets = alloc_stat::top_buckets(3)
+                .iter()
+                .map(|(k, v)| format!("{k}={:.1}MB", *v as f64 / 1048576.0))
+                .collect::<Vec<_>>()
+                .join(" ");
+            logln!(
+                "[mem] Rust 活 {:.1}MB/{}块 ({:+.0}KB/s) | RSS {:.0}MB ({:+.0}KB/s) | 最大档 {buckets}",
+                live_b as f64 / 1048576.0,
+                live_n,
+                db / 1024,
+                rss as f64 / 1024.0,
+                dr / 1024
+            );
+
+            // 内存看门狗：这套 libmpv 在「渲染到外部 FBO」路径上每渲染一帧漏约 5KB
+            // C 侧内存（Rust 活字节完全不涨，见上行的 [mem] 诊断）。桶在渲染上下文里，
+            // 定期 free+create 就能收回来，且不影响播放进度。
+            // 正常策略：有画面后记基线，涨过 MEM_GROWTH_MB 才重建（默认约 40 分钟一次）；
+            // 调试策略：DOUYU_RC_RECYCLE=秒 强制按固定周期重建。
+            if self.rss_base == 0 && self.frame_w > 0 {
+                self.rss_base = rss;
+                logln!("[mem] 内存基线 {}MB，超过 +{}MB 时重建渲染上下文", rss / 1024, MEM_GROWTH_MB);
+            }
+            let force = std::env::var("DOUYU_RC_RECYCLE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            let limit_mb = std::env::var("DOUYU_MEM_LIMIT_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(MEM_GROWTH_MB);
+            let due = match force {
+                Some(secs) => self.rc_recycled_at.elapsed() >= Duration::from_secs(secs.max(5)),
+                None => {
+                    self.rss_base > 0
+                        && rss > self.rss_base + limit_mb * 1024
+                        && self.rc_recycled_at.elapsed() >= Duration::from_secs(120)
+                }
+            };
+            if due {
+                if let Some(p) = &self.player {
+                    let before = rss;
+                    match p.recycle_render_ctx() {
+                        Ok(()) => {
+                            self.rc_recycled_at = Instant::now();
+                            // 重新连渲染目标：旧纹理要显式删掉，下一帧会重建并重新注册
+                            self.drop_gl_target();
+                            self.pending_size = None;
+                            self.size_stable_at = None;
+                            // 基线跟着下移：否则重建完立刻又满足「超阈值」
+                            self.rss_base = alloc_stat::rss_kb();
+                            logln!(
+                                "[mem] 已重建渲染上下文：RSS {}MB → {}MB（阈值 +{}MB，约 {} 分钟一次）",
+                                before / 1024,
+                                self.rss_base / 1024,
+                                limit_mb,
+                                // 实测 ~310KB/s，换算成分钟（仅用于日志展示）
+                                (limit_mb * 1024 / 310 / 60).max(1)
+                            );
+                        }
+                        Err(e) => {
+                            logln!("[mem] 重建渲染上下文失败: {e}（下个周期再试）");
+                            self.rc_recycled_at = Instant::now();
+                        }
+                    }
+                }
+            }
             self.frame_count = 0;
             self.fps_timer = Instant::now();
         }
@@ -1596,7 +1789,7 @@ fn setup_fonts(ctx: &egui::Context) {
         if let Ok(data) = std::fs::read(path) {
             fonts
                 .font_data
-                .insert("cjk".into(), egui::FontData::from_owned(data).into());
+                .insert("cjk".into(), egui::FontData::from_owned(data));
             if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 fam.insert(0, "cjk".into());
             }
@@ -1642,11 +1835,15 @@ fn main() {
             .with_title("斗鱼直播"),
         ..Default::default()
     };
-    let _ = eframe::run_native(
+    // 启动失败（无显示/GPU 初始化失败）必须留下日志：
+    // 否则「双击没反应」时既没有窗口也没有任何线索
+    if let Err(e) = eframe::run_native(
         "斗鱼直播",
         options,
         Box::new(|cc| Ok(Box::new(DouyuApp::new(cc)))),
-    );
+    ) {
+        logln!("启动 GUI 失败: {e}");
+    }
 }
 
 /// 调试：连接弹幕并打印收到的弹幕
@@ -1750,8 +1947,9 @@ fn cmd_login_exchange(rest: &[String]) {
 fn cmd_login_test() {
     match login::generate() {
         Ok(s) => {
-            let code_short = &s.code[..s.code.len().min(20)];
-            let url_short = &s.url[..s.url.len().min(90)];
+            // 截断走字符边界（head）：直接按字节切片在非 ASCII 上会 panic
+            let code_short = log::head(&s.code, 20);
+            let url_short = log::head(&s.url, 90);
             logln!("[test] 二维码生成成功 code={code_short} url={url_short}");
             // 验证：生成二维码 PNG（供解码器校验）
             if let Ok((w, px)) = login::qr_matrix(&s.url) {

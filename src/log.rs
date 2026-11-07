@@ -63,6 +63,22 @@ pub fn init() {
     }
 }
 
+/// 按字节上限截断，并保证落在 UTF-8 字符边界上。
+///
+/// 直接 `&s[..n]` 在中文上会 panic（"byte index is not a char boundary"），
+/// 而 release 构建是 `panic = "abort"` —— 不是一个线程挂掉，是整个进程直接消失
+/// 且不留任何日志。所有「截一段进日志」的地方都必须走这里。
+pub fn head(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub fn line(s: &str) {
     if let Some(m) = LOG.get() {
         if let Ok(mut g) = m.lock() {

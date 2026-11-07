@@ -6,6 +6,7 @@
 use crate::logln;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -13,14 +14,26 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 // 设备指纹，造一个固定值即可（与网页端行为一致）
 const DID: &str = "10000000000000000000000000001501";
 
+/// 取流链路复用的 HTTP agent（native-tls/openssl）。
+///
+/// 一次取流会发好几个请求（签名脚本 + getH5Play，外加 300s 续流预取、切画质重取），
+/// 之前每次都新建 TlsConnector —— 等于每次都重新加载一遍系统根证书，纯属浪费。
+/// ureq 的 Agent 内部是 Arc + 连接池，clone 廉价且线程安全。
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
 pub fn agent() -> ureq::Agent {
     // 用 openssl（native-tls）而非 rustls：斗鱼 CDN 与弹幕服务器一样用静态 RSA
     // 密钥交换，rustls 不支持。openssl 默认协商 TLS1.2 + RSA cipher。
+    if let Some(a) = AGENT.get() {
+        return a.clone();
+    }
     let tls = native_tls::TlsConnector::new().expect("创建 TLS connector 失败");
-    ureq::AgentBuilder::new()
+    let a = ureq::AgentBuilder::new()
         .try_proxy_from_env(false)
         .tls_connector(std::sync::Arc::new(tls))
-        .build()
+        .build();
+    let _ = AGENT.set(a.clone());
+    a
 }
 
 fn get(url: &str, referer: &str) -> Result<String, String> {
@@ -141,10 +154,15 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
 
     let url = format!("https://www.douyu.com/lapi/live/getH5Play/{rid}");
     let resp_body = post(&url, &format!("https://www.douyu.com/{rid}"), &body)?;
-    // 调试：DOUYU_DEBUG=1 时记录原始响应（确认 multirates 是否带 url 字段）
+    // 调试：DOUYU_DEBUG=1 时记录原始响应（确认 multirates 是否带 url 字段）。
+    // 截断必须走字符边界：resp_body 是含中文的 JSON，直接 &resp_body[..2500]
+    // 有 2/3 概率切在汉字中间 → panic，而 panic=abort 等于整个进程消失。
     if std::env::var("DOUYU_DEBUG").ok().as_deref() == Some("1") {
-        let n = resp_body.len().min(2500);
-        logln!("[stream] 原始响应({}B): {}", resp_body.len(), &resp_body[..n]);
+        logln!(
+            "[stream] 原始响应({}B): {}",
+            resp_body.len(),
+            crate::log::head(&resp_body, 2500)
+        );
     }
     let resp: H5Resp =
         serde_json::from_str(&resp_body).map_err(|e| format!("取流响应解析失败: {e}"))?;
@@ -176,7 +194,7 @@ pub fn get_stream(rid: &str, quality: i32) -> Result<Stream, String> {
     };
     // 日志只记录主机部分（避免 token 刷屏，也不泄露完整鉴权串）
     let host = url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
-    let tail = url.split('/').last().unwrap_or("");
+    let tail = url.split('/').next_back().unwrap_or("");
     let tail_short = if tail.len() > 46 { &tail[..46] } else { tail };
     logln!(
         "[stream] 取流成功 rid={rid} quality={quality} cdn={cdn} host={host} 来源={src_kind} 流={tail_short} 档位={}",

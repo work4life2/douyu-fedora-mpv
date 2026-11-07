@@ -140,7 +140,8 @@ fn connect_danmaku() -> Result<WebSocket<WsStream>, String> {
         .build()
         .map_err(|e| format!("构建 TLS connector 失败: {e}"))?;
 
-    let mut req = "wss://danmuproxy.douyu.com:8506/"
+    let mut req = format!("wss://{HOST}/")
+        .as_str()
         .into_client_request()
         .map_err(|e| e.to_string())?;
     req.headers_mut()
@@ -190,6 +191,9 @@ pub fn run(rid: String, stop: Arc<AtomicBool>, tx: Sender<Chat>) {
         match connect_danmaku() {
             Ok(ws) => {
                 logln!("[danmaku] 已连接房间 {rid}");
+                // 连接成功即重置退避：否则一次网络抖动之后 backoff 一路涨到 30s，
+                // 之后哪怕网络完全恢复，每次断线都要白等 30 秒
+                backoff = 3;
                 match session(ws, &rid, &tx, &stop) {
                     Ok(()) => return, // 主动停止
                     Err(e) => {
@@ -208,7 +212,7 @@ pub fn run(rid: String, stop: Arc<AtomicBool>, tx: Sender<Chat>) {
             }
         }
         sleep_stoppable(&stop, backoff);
-        // 反复失败拉长间隔（热房封 IP 时别硬顶），成功过一次后退回 3 秒
+        // 反复失败拉长间隔（热房封 IP 时别硬顶）
         backoff = (backoff * 2).min(30);
     }
 }
